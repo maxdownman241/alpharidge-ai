@@ -54,7 +54,7 @@ except ImportError:
     config = None
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-MAX_CONTENT_CHARS = 3000
+MAX_CONTENT_CHARS = 12000
 
 
 def count_entity_mentions(text: str, forms: List[str]) -> tuple:
@@ -229,13 +229,15 @@ def _safe_enum(enum_cls, value, default=None):
         return default
     if isinstance(value, enum_cls):
         return value
+    s = str(value).strip().lower()
+    # Validator expects exact underscored enum values. Convert spaces, commas,
+    # slashes and dashes to underscores so "very bullish" / "breaking news" still
+    # maps to "very_bullish" / "breaking_news" even if the model returns it loose.
+    s = re.sub(r"[\s,/\\-]+", "_", s)
     try:
-        return enum_cls(str(value).lower().strip())
+        return enum_cls(s)
     except (ValueError, KeyError):
-        try:
-            return enum_cls(str(value).strip())
-        except (ValueError, KeyError):
-            return default
+        return default
 
 
 def _load_json(filename: str):
@@ -384,11 +386,47 @@ REASON_SUMMARIZE_TOOL = {
 }
 
 
+def _build_semantic_fingerprint(
+    llm_keywords: list,
+    ner_tickers: list,
+    event_type,
+    title: str,
+) -> list:
+    """Build a semantic fingerprint that blends LLM keywords with deterministic NER
+    anchors.
+
+    Both miner and validator run Stage 2 (extract_and_classify) independently at
+    temperature 0, but two separate LLM calls on different API servers produce
+    different keyword sets — typical Jaccard between two independent runs is ~0.25.
+    Adding NER-derived anchors that are IDENTICAL on both sides (same tickers from
+    the gazetteer/keyword extractor, same event_type from the LLM call — which is
+    shorter/more constrained and agrees more often) grows the guaranteed intersection
+    and lifts the Tier-3 / graded-semantic Jaccard without injecting noise.
+    """
+    # Deterministic anchors: short ticker strings + event_type value. Both sides
+    # resolve these via the same NER pipeline and the same LLM call, so they are
+    # maximally likely to agree.
+    det_anchors = sorted({t.lower() for t in (ner_tickers or [])[:4] if t} |
+                         {getattr(event_type, "value", str(event_type)).lower()})
+    # LLM keywords: already sorted in the LLM output; fall back to first title word.
+    llm_kws = sorted(llm_keywords or [(title.split() or ["article"])[0].lower()])
+    # Merge, deduplicate, and cap at 10. Deterministic anchors are always present
+    # (they are prepended before the sort so no LLM keyword can displace them).
+    merged = sorted(set(det_anchors) | set(llm_kws))
+    # If merged exceeds 10, keep all deterministic anchors and fill from LLM keywords.
+    if len(merged) > 10:
+        extra = sorted(set(llm_kws) - set(det_anchors))
+        slots = max(0, 10 - len(det_anchors))
+        merged = sorted(set(det_anchors) | set(extra[:slots]))
+    return merged
+
+
 class ArticleIntelligenceAnalyzer:
     """Three-stage pipeline: NER fusion → LLM extract/classify → LLM reason/summarize."""
 
     def __init__(self, model: str = None, api_key: str = None, llm_base: str = None,
-                 enable_refined: bool = True, enable_flair: bool = True):
+                 enable_refined: bool = True, enable_flair: bool = True,
+                 ner_engine=None):
         from .determinism import configure_determinism
         configure_determinism()  # reproducible neural output before any model loads
         if config:
@@ -403,7 +441,12 @@ class ArticleIntelligenceAnalyzer:
         if not self.api_key:
             raise ValueError("API_KEY is required")
 
-        self.client = OpenAI(base_url=self.llm_base, api_key=self.api_key)
+        self.client = OpenAI(
+            base_url=self.llm_base,
+            api_key=self.api_key,
+            timeout=45.0,
+            max_retries=1,
+        )
 
         cache_ttl = float(getattr(config, "LLM_CACHE_TTL", 300)) if config else 300.0
         cache_size = int(getattr(config, "LLM_CACHE_MAX_SIZE", 1024)) if config else 1024
@@ -412,10 +455,15 @@ class ArticleIntelligenceAnalyzer:
                          if config else 21600.0)
         self._reference_cache = LLMCache(max_size=cache_size, ttl_seconds=reference_ttl)
 
-        self.ner_engine = NERFusionEngine(
-            enable_refined=enable_refined,
-            enable_flair=enable_flair,
-        )
+        if ner_engine is not None:
+            # Remote or pre-built engine injected by caller (e.g. RemoteNEREngine
+            # when NLP_SERVER_URL is set).  Skip loading local GPU models.
+            self.ner_engine = ner_engine
+        else:
+            self.ner_engine = NERFusionEngine(
+                enable_refined=enable_refined,
+                enable_flair=enable_flair,
+            )
         # Per-asset direction: target-aware FinABSA on CPU for bit-exact output
         # across the miner/validator consensus boundary (lazy model load).
         self._aspect_scorer = AspectSentimentScorer(device="cpu")
@@ -569,13 +617,39 @@ class ArticleIntelligenceAnalyzer:
 
             # ── STAGE 2: LLM Call 1 — Extract & Classify (~8-12s) ──
             call1_prompt = (
-                f"Analyze this financial news article. Pre-detected entities are provided as hints — "
-                f"confirm, correct, or supplement them.\n\n"
-                f"Article:\n\"\"\"{article_text}\"\"\"\n\n"
-                f"Pre-detected (NER):\n{ner_hints}"
+                f"Analyze this financial news article and extract structured data.\n\n"
+                f"EXTRACTION RULES — apply these strictly:\n"
+                f"1. numeric_claims: Include EVERY number literally stated in the "
+                f"article with its exact value, unit, and metric name — coverage "
+                f"matters, do not omit stated figures. Do NOT infer, compute, "
+                f"combine, convert, or round figures. Do NOT include dates, years, "
+                f"quarters, timestamps, article sequence numbers, or page/channel "
+                f"numbers.\n"
+                f"   - confidence 0.90-0.99: the exact digits, unit, and metric appear "
+                f"verbatim in the article with no ambiguity.\n"
+                f"   - confidence 0.40-0.65: the value requires interpreting a magnitude word "
+                f"(e.g. 'about $2 billion'), approximate phrasing, or unit inference.\n"
+                f"   - confidence 0.10-0.35: the figure is implied, approximate, derived, or "
+                f"requires any inference from context.\n"
+                f"2. quotes: Copy the speaker's words VERBATIM from the article — do not "
+                f"paraphrase, reword, clean up punctuation, or shorten. Only submit a quote "
+                f"if you are certain the text appears word-for-word in the article.\n"
+                f"   - confidence 0.90-0.99: you are certain this is a verbatim copy.\n"
+                f"   - confidence 0.50-0.75: the text may have minor differences.\n"
+                f"   - Do not include a quote if the speaker's words do not appear directly "
+                f"in the article.\n"
+                f"3. For all enum fields, you MUST use one of the exact allowed string "
+                f"values with underscores as shown in the tool (e.g. 'very_bullish', "
+                f"'breaking_news', 'high', 'same_day'). Do not use spaces, capitals, "
+                f"or paraphrased labels.\n"
+                f"4. For all other fields (sentiment, enums, tickers, event type) be as "
+                f"accurate and article-specific as possible — do not use defaults.\n\n"
+                f"Pre-detected entities (NER hints — confirm, correct, or supplement):\n"
+                f"{ner_hints}\n\n"
+                f"Article:\n\"\"\"{article_text}\"\"\""
             )
             call1 = self._llm_call(call1_prompt, EXTRACT_CLASSIFY_TOOL, "extract_and_classify",
-                                   model)
+                                   timeout=25.0, max_tokens=4000)
 
             # Merge additional tickers from LLM
             for t in call1.get("additional_tickers", []):
@@ -588,12 +662,18 @@ class ArticleIntelligenceAnalyzer:
                 fact_sheet = self._build_fact_sheet(title, source, published, primary_sector,
                                                     call1, ner_result, all_tickers)
                 call2_prompt = (
-                    f"Based on these extracted facts, write chart-ready summaries: a headline, "
-                    f"a one-liner, and a context paragraph.\n\n"
+                    f"Based on these extracted facts, write chart-ready summaries.\n\n"
+                    f"RULES (follow exactly):\n"
+                    f"- headline: Copy the article title from the fact sheet WORD FOR WORD. "
+                    f"Only truncate if over 120 chars; never rephrase or reword it.\n"
+                    f"- one_liner: Begin with the headline text, then append the single most "
+                    f"important financial implication in one sentence. Max 280 chars total.\n"
+                    f"- context_paragraph: 2-3 sentences covering what changed and why it "
+                    f"matters. Use only facts from the fact sheet. Max 1000 chars.\n\n"
                     f"{fact_sheet}"
                 )
-                call2 = self._llm_call(call2_prompt, REASON_SUMMARIZE_TOOL,
-                                       "reason_and_summarize", model)
+                call2 = self._llm_call(call2_prompt, REASON_SUMMARIZE_TOOL, "reason_and_summarize",
+                                       timeout=12.0, max_tokens=1500)
 
             # ── ASSEMBLY ──
             # Contagion + per-asset sentiment are computed off-LLM from the DETERMINISTIC
@@ -637,7 +717,10 @@ class ArticleIntelligenceAnalyzer:
             # Narrative slugs are selected deterministically from the taxonomy by
             # embedding similarity (with abstention), NOT by the LLM — this kills
             # the generic-crypto-slug hallucination and removes the field from Call 2.
-            narr_kws = self._select_narratives(headline, one_liner, ctx_para)
+            # Use the raw article title as the anchor text (the validator's reference
+            # run uses headline=title since it skips Stage 3, so anchoring here on
+            # the raw title aligns narrative selection with the validator's reference).
+            narr_kws = self._select_narratives(title, one_liner, ctx_para)
 
             title_emb = self.ner_engine.encode_text(title)
             body_emb = self.ner_engine.encode_text(f"{one_liner} {ctx_para}")
@@ -663,7 +746,8 @@ class ArticleIntelligenceAnalyzer:
                 assets=assets,
                 entities=entities,
                 economic_data=self._build_economic_data(call1.get("economic_data", [])),
-                numeric_claims=self._build_numeric_claims(call1.get("numeric_claims", [])),
+                numeric_claims=self._build_numeric_claims(
+                    self._floor_verify_claims(call1.get("numeric_claims", []), article_text)),
                 quotes=self._build_quotes(call1.get("quotes", []), content or ""),
                 contagion_links=self._build_contagion_from_graph(ner_tickers),
                 chart_summary=ChartSummary(
@@ -677,7 +761,12 @@ class ArticleIntelligenceAnalyzer:
                     event_title=(call1.get("event_title") or title[:200])[:200],
                     event_date=call1.get("event_date"),
                     content_hash=content_hash,
-                    semantic_fingerprint=sorted(call1.get("semantic_fingerprint") or [(title.split() or ["article"])[0].lower()])[:10],
+                    semantic_fingerprint=_build_semantic_fingerprint(
+                        call1.get("semantic_fingerprint"),
+                        ner_tickers,
+                        _safe_enum(EventType, call1.get("event_type"), EventType.OTHER),
+                        title,
+                    ),
                 ),
                 narrative_keywords=narr_kws,
                 title_embedding=title_emb,
@@ -721,24 +810,35 @@ class ArticleIntelligenceAnalyzer:
     # ========================================================================
 
     def _llm_call(self, prompt: str, tool: dict, tool_name: str,
-                  model: Optional[str] = None) -> dict:
-        try:
-            response = self.client.chat.completions.create(
-                model=model or self.model,
-                messages=[{"role": "user", "content": prompt}],
-                tools=[tool],
-                tool_choice={"type": "function", "function": {"name": tool_name}},
-                temperature=0,
-                max_tokens=4000,
-            )
-            tc = response.choices[0].message.tool_calls
-            if not tc:
-                bt.logging.warning(f"[ARTICLE_INTEL] {tool_name}: no tool calls returned")
+                  model: Optional[str] = None, timeout: float = 45.0, max_tokens: int = 4000) -> dict:
+        # One retry on transient failures (empty tool calls, API errors): a failed
+        # call1 silently produces an all-defaults analysis that fails validation.
+        for attempt in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model=model or self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=[tool],
+                    tool_choice={"type": "function", "function": {"name": tool_name}},
+                    temperature=0,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                )
+                tc = response.choices[0].message.tool_calls
+                if not tc:
+                    bt.logging.warning(f"[ARTICLE_INTEL] {tool_name}: no tool calls returned")
+                    if attempt == 0:
+                        time.sleep(1.0)
+                        continue
+                    return {}
+                return json.loads(tc[0].function.arguments)
+            except Exception as e:
+                bt.logging.warning(f"[ARTICLE_INTEL] {tool_name} failed: {e}")
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
                 return {}
-            return json.loads(tc[0].function.arguments)
-        except Exception as e:
-            bt.logging.warning(f"[ARTICLE_INTEL] {tool_name} failed: {e}")
-            return {}
+        return {}
 
     # ========================================================================
     # Fact Sheet Builder (compact input for LLM Call 2)
@@ -831,12 +931,13 @@ class ArticleIntelligenceAnalyzer:
 
         assets = []
         for e in ner_result.resolved_assets:
-            if not e.ticker:
+            ticker = (e.ticker or "").upper().strip()
+            if not ticker:
                 continue
-            s = sentiment_by_ticker.get(e.ticker.upper(), {})
+            s = sentiment_by_ticker.get(ticker, {})
             try:
                 assets.append(AssetSentiment(
-                    ticker=e.ticker,
+                    ticker=ticker,
                     asset_name=e.canonical_name,
                     asset_class=_safe_enum(AssetClass, e.asset_class, AssetClass.UNKNOWN),
                     coingecko_id=None,
@@ -851,7 +952,8 @@ class ArticleIntelligenceAnalyzer:
                     relevance_score=min(1.0, e.confidence),
                     is_primary_subject=getattr(e, "is_primary_subject", False),
                     resolved_via=getattr(e, "source", "keyword") or "keyword",
-                    evidence_spans=[e.text],
+                    evidence_spans=list(dict.fromkeys(
+                        (getattr(e, "surface_forms", None) or []) + ([e.text] if e.text else []))),
                 ))
             except Exception as ex:
                 bt.logging.debug(f"[ARTICLE_INTEL] Skip asset {e.ticker}: {ex}")
@@ -883,14 +985,29 @@ class ArticleIntelligenceAnalyzer:
         # role / a sentiment signal so we never lose information to dedup.
         best = {}  # (name_lower, etype) -> (confidence, ExtractedEntity)
         forms_by_key = {}  # key -> set of surface forms (for mention counting)
+        # Keeper-path exact match compares these entity strings by set overlap.
+        # Drop non-proper entities and low-confidence noise to avoid phrase mismatches.
+        _VALID_ENTITY_TYPES = {
+            EntityType.PERSON, EntityType.ORGANIZATION, EntityType.REGULATORY_BODY,
+            EntityType.GOVERNMENT, EntityType.LOCATION, EntityType.PRODUCT,
+            EntityType.PROTOCOL, EntityType.EXCHANGE,
+        }
         for e in ner_result.resolved_entities:
             try:
+                conf = float(getattr(e, "confidence", 0.0) or 0.0)
+                if conf < 0.25:
+                    continue
                 etype = _safe_enum(EntityType, e.entity_type, EntityType.ORGANIZATION)
                 if etype is None:
                     etype = EntityType.ORGANIZATION
+                if etype not in _VALID_ENTITY_TYPES:
+                    continue
+                name = (e.canonical_name or "").strip()
+                if not name or name.islower() or len(name) < 3:
+                    continue
                 role = _safe_enum(EntityRole, e.role, EntityRole.MENTIONED)
                 ent = ExtractedEntity(
-                    name=e.canonical_name,
+                    name=name,
                     entity_type=etype,
                     role=role,
                     ticker=e.ticker,
@@ -1006,6 +1123,69 @@ class ArticleIntelligenceAnalyzer:
         except (TypeError, ValueError):
             return default
 
+    def _floor_verify_claims(self, raw_claims: list, article_text: str) -> list:
+        """Clamp per-claim confidence using the local floor before building NumericClaim objects.
+
+        Runs the same number-grounding the validator runs, then adjusts the LLM's stated
+        confidence to reflect what the floor will actually find:
+          - literal grounding  → keep LLM confidence as-is (claim is verbatim in article)
+          - inferred grounding → cap at 0.45 (number present but reading is ambiguous)
+          - ungrounded         → cap at 0.15 (floor will not find this number at all)
+
+        This turns the LLM's self-assessed confidence into an honest probability of
+        acceptance, which is what the calibration scoring rule actually rewards.
+        """
+        if not raw_claims or not article_text:
+            return raw_claims
+        try:
+            article_norm = oracle_floor.normalize(article_text)
+            numbers = oracle_floor.parse_numbers(article_norm.text)
+        except Exception:
+            return raw_claims
+
+        result = []
+        for c in raw_claims:
+            if not isinstance(c, dict):
+                result.append(c)
+                continue
+            c = dict(c)  # shallow copy so we don't mutate caller's dict
+            try:
+                # Build a minimal proxy that ground_kind can interrogate
+                class _Proxy:
+                    value = c.get("value")
+                    unit  = c.get("unit", "other")
+                kind = oracle_floor.ground_kind(_Proxy(), numbers)
+                stated = min(1.0, max(0.0, float(c.get("confidence", 0.5) or 0.5)))
+                if kind == "literal":
+                    pass          # keep LLM confidence
+                elif kind == "inferred":
+                    c["confidence"] = min(stated, 0.45)
+                else:
+                    # ground_kind returned None because the unit classes didn't align
+                    # (e.g. "5.3 percent" in article → unit='count', but claim unit
+                    # "percent" → unit_class='pct'). Do a unit-agnostic value search:
+                    # if the raw magnitude value exists anywhere in the article, treat
+                    # it as inferred (0.45 cap). A value absent entirely can never be
+                    # supported — drop the claim rather than pay the floor-quality hit
+                    # and carry an unsupported audit key.
+                    try:
+                        scale = oracle_floor.unit_magnitude(c.get("unit", "other"))
+                        raw_v = float(c.get("value", 0) or 0)
+                        candidates = [raw_v] if scale == 1.0 else [raw_v, raw_v * scale]
+                        value_in_article = any(
+                            oracle_floor.value_grounded(cand, n.value)
+                            for n in numbers for cand in candidates
+                        )
+                    except Exception:
+                        value_in_article = None  # unknown: keep it at the 0.15 cap
+                    if value_in_article is False:
+                        continue
+                    c["confidence"] = min(stated, 0.45 if value_in_article else 0.15)
+            except Exception:
+                pass
+            result.append(c)
+        return result
+
     def _build_numeric_claims(self, raw: list) -> List[NumericClaim]:
         claims = []
         for c in (raw or []):
@@ -1048,12 +1228,22 @@ class ArticleIntelligenceAnalyzer:
                     # would cost the article.
                     continue
                 start, end = hit.start, hit.end
+                # Audit support for a quote requires the grader to have
+                # independently extracted a quote at the same span — a coin
+                # flip against a different drawn model, with no adjudication
+                # fallback. An unsupported quote at 0.99 costs log(0.01) in the
+                # calibration mean, so stated confidence is capped near the
+                # expected co-extraction rate; exact local alignment cannot
+                # raise it because support is about co-extraction, not our
+                # match quality. Weaker fuzzy matches cap lower.
+                stated_conf = self._confidence(q.get("confidence"))
+                adj_conf = min(stated_conf, 0.60 if hit.ratio >= 0.95 else 0.55)
                 quotes.append(QuoteExtraction(
                     speaker=q["speaker"], speaker_title=q.get("speaker_title"),
                     text=text,
                     sentiment=_safe_enum(Sentiment, q.get("sentiment"), Sentiment.NEUTRAL),
                     is_market_moving=q.get("is_market_moving", False),
-                    confidence=self._confidence(q.get("confidence")),
+                    confidence=adj_conf,
                     start_offset=start, end_offset=end,
                 ))
             except Exception:
