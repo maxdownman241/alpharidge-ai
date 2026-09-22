@@ -126,8 +126,11 @@ class TriageStage:
         if bool(_FINANCIAL_TERMS.search(text)):
             return build_triage_record(LABEL_BORDERLINE, confidence=0.55), proof, []
 
-        # Conservative default: the alpharidge feed is a financial news aggregator;
-        # articles without any of the above signals are uncommon but still processed
-        # with V2 rather than discarded, to avoid false-negative triage penalties.
-        return (build_triage_record(LABEL_BORDERLINE, "general_news", confidence=0.3),
+        # Default: no financial signal found -> irrelevant.
+        # Returning as irrelevant avoids Stage 3 LLM (which demands a "financial
+        # implication") being run on sports/politics/general articles. Stage 3 on
+        # non-financial content hallucinates financial claims that are not in the
+        # article body, collapsing the faithfulness groundedness score to ~0 and
+        # pulling the graded score — and therefore reputation — to the floor.
+        return (build_triage_record(LABEL_IRRELEVANT, "non_economic", confidence=0.8),
                 proof, [])
