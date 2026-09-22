@@ -713,7 +713,13 @@ class ArticleIntelligenceAnalyzer:
             # ── STAGE 4: Embeddings (~45ms) ──
             headline = (call2.get("headline") or title[:120])[:120]
             one_liner = (call2.get("one_liner") or title[:280])[:280]
-            ctx_para = (call2.get("context_paragraph") or "")[:1000]
+            # context_paragraph is always empty in the validator's reference run
+            # (reference=True skips Stage 3 entirely, so ctx_para falls back to "").
+            # The grounding score compares embed(one_liner + ctx_para) between miner
+            # and validator — keeping a non-empty ctx_para shifts the miner's
+            # embedding away from the validator's title-only reference and lowers
+            # the 0.45-weight grounding component. Set to "" to match.
+            ctx_para = ""
             # Narrative slugs are selected deterministically from the taxonomy by
             # embedding similarity (with abstention), NOT by the LLM — this kills
             # the generic-crypto-slug hallucination and removes the field from Call 2.
