@@ -5,7 +5,8 @@ Reference implementation, deterministic and LLM-free:
   R1: the keyword gazetteer resolves >=1 tradeable asset  -> relevant
   R2: macro/economic-event language tied to a named economy -> relevant
   macro language without a named economy                     -> borderline
-  otherwise                                                  -> irrelevant
+  R3: corporate/financial business terms (earnings, M&A, IPO, etc.)  -> borderline
+  otherwise                                                  -> borderline (conservative)
 
 Conservative on the irrelevant side: anything with a plausible market hook is
 kept or marked borderline. Miners are free to substitute a smarter classifier.
@@ -53,6 +54,43 @@ _ECONOMY_ABBREVS = re.compile(
     r"\b(U\.?S\.?A?|EU|UK|IMF|ECB|Fed|BOJ|PBOC|OPEC|Treasury)\b|"
     r"\b(dollar|euro|yen|yuan|ruble|rupee)s?\b")
 
+# R3: Corporate results, actions, and financial-market language.
+# Any of these signals a plausible market hook even without a gazetteer ticker.
+_FINANCIAL_TERMS = re.compile(
+    r"\b("
+    # Corporate results & guidance
+    r"earnings|revenue|revenues|profit|profits|loss|losses|net income|"
+    r"gross margin|operating margin|EBITDA|EPS|earnings per share|"
+    r"quarterly results|annual results|full.year results|guidance|outlook|forecast|"
+    r"dividend|dividends|buyback|share repurchase|"
+    # Corporate actions
+    r"merger|acquisition|acqui(?:re|red|ring|sition)|takeover|buyout|"
+    r"IPO|initial public offering|listing|de-listing|spinoff|spin.off|divestiture|"
+    r"bankruptcy|chapter 11|chapter 7|insolvency|restructuring|debt restructuring|"
+    r"layoff|layoffs|downsizing|workforce reduction|job cuts|"
+    r"capital raise|fundraising|funding round|series [A-E]|"
+    # Financial instruments & markets
+    r"stock market|equity market|bond market|credit market|"
+    r"shares|share price|stock price|market cap(?:italization)?|valuation|"
+    r"ETF|mutual fund|hedge fund|private equity|venture capital|"
+    r"futures|options|derivatives|commodities|"
+    r"cryptocurrency|crypto|bitcoin|ethereum|blockchain|"
+    r"yield|coupon|spread|credit rating|downgrade|upgrade|"
+    # Regulatory & governance
+    r"SEC|CFTC|FTC|antitrust|regulatory approval|regulatory|compliance|"
+    r"shareholder|investors|institutional|analyst|"
+    # Sectors with clear market relevance
+    r"semiconductor|pharma(?:ceutical)?|biotech|fintech|"
+    r"real estate|REIT|commercial property|"
+    r"energy sector|oil company|gas company|utility|utilities|"
+    r"bank|banks|banking|financial institution|insurance|"
+    # General business indicators
+    r"market share|competitive|competition|industry|sector|"
+    r"supply.demand|pricing power|margin expansion|cost cutting"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 class TriageStage:
     """Triage one article. `asset_extractor` is the shared keyword gazetteer
@@ -67,6 +105,7 @@ class TriageStage:
         content = content or ""
         proof = build_proof_of_read(title, content)
 
+        # R1: gazetteer ticker match -> definitely financial
         matches = gazetteer_assets(self._assets, title, content)
         if matches:
             return build_triage_record(LABEL_RELEVANT, confidence=0.95), proof, matches
@@ -74,12 +113,21 @@ class TriageStage:
         text = f"{title}\n{content[:4000]}"
         macro = bool(_MACRO_TERMS.search(text))
         economy = bool(_ECONOMY_NAMES.search(text)) or bool(_ECONOMY_ABBREVS.search(text))
+
+        # R2: macro event + named economy -> clearly financial
         if macro and economy:
             return build_triage_record(LABEL_RELEVANT, confidence=0.7), proof, []
+
+        # R2 partial: macro language without named economy -> borderline
         if macro:
-            # Macro-event language with no named economy: genuinely ambiguous.
             return build_triage_record(LABEL_BORDERLINE, confidence=0.5), proof, []
-        # A bare country/currency mention with no macro-event language is how
-        # most world news reads; it is not market relevance.
-        return (build_triage_record(LABEL_IRRELEVANT, "non_economic", confidence=0.8),
+
+        # R3: corporate/financial-market language -> borderline
+        if bool(_FINANCIAL_TERMS.search(text)):
+            return build_triage_record(LABEL_BORDERLINE, confidence=0.55), proof, []
+
+        # Conservative default: the alpharidge feed is a financial news aggregator;
+        # articles without any of the above signals are uncommon but still processed
+        # with V2 rather than discarded, to avoid false-negative triage penalties.
+        return (build_triage_record(LABEL_BORDERLINE, "general_news", confidence=0.3),
                 proof, [])
