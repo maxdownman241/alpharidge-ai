@@ -12,6 +12,8 @@ backed up like the reward store.
 """
 from __future__ import annotations
 import json
+
+import bittensor as bt
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -44,6 +46,14 @@ Obs = Tuple[int, float, float, int]
 MAX_SEQ_EPOCH_SKEW = 100
 MAX_OBS_PER_TARGET = 512
 MAX_TARGETS_PER_SENDER = 1024
+
+# Stands in for "no registration" on a record nobody currently holds.
+UNHELD = -1
+
+# A reconcile pass clears at most this many records; the oldest go first and the rest
+# wait for the next pass, so a backlog (a validator that was down) drains on its own.
+MAX_CLEAR_PER_PASS = 20
+MAX_CLEAR_FRACTION = 0.05
 
 
 @dataclass
@@ -97,10 +107,19 @@ class ReputationStore:
         entry = {"r": float(v["r"]), "n": int(v.get("n", 0))}
         if "e" in v:
             entry["e"] = int(v["e"])
+        for field in ("u", "b"):
+            if v.get(field) is not None:
+                entry[field] = int(v[field])
         raw = v.get("c")
         if isinstance(raw, dict):
-            entry["c"] = {str(name): ReputationStore._load_channel(c)
-                          for name, c in raw.items() if name in ch.CHANNELS}
+            # Channels this version does not know are kept as they are, so running an
+            # older release against newer state does not erase their history.
+            entry["c"] = {}
+            for name, c in raw.items():
+                try:
+                    entry["c"][str(name)] = ReputationStore._load_channel(c)
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
         else:
             # State written before channels existed carries on as the legacy channel.
             entry["c"] = {ch.LEGACY: ReputationStore._settled(entry["r"], entry["n"])}
@@ -287,6 +306,91 @@ class ReputationStore:
         if gone:
             self.save()
         return len(gone)
+
+    # ---- identity ----
+
+    def reconcile_identities(self, rows) -> Tuple[int, int]:
+        """Bind each record to the registration that earned it.
+
+        `rows` is (uid, hotkey, registration block) read from the chain. A record follows
+        its registration: the same registration under a new hotkey keeps it, and a new
+        registration starts empty, whichever hotkey holds it. Records with no binding yet
+        are adopted by the registration currently holding them.
+
+        Returns (cleared, moved). Both validators must pass the same rows.
+        """
+        rows = list(rows)
+        cleared = moved = adopted = 0
+        by_slot = {}
+        for hk, st in self.state.items():
+            if st.get("u") is not None and st.get("b") is not None:
+                by_slot.setdefault((int(st["u"]), int(st["b"])), []).append(hk)
+        for holders in by_slot.values():
+            holders.sort()
+
+        doomed = sorted(
+            (int(self.state[hotkey]["b"]), str(hotkey), int(reg_block))
+            for _, hotkey, reg_block in rows
+            if hotkey in self.state
+            and self.state[hotkey].get("b") is not None
+            and int(self.state[hotkey]["b"]) != int(reg_block))
+        limit = max(MAX_CLEAR_PER_PASS, int(MAX_CLEAR_FRACTION * len(self.state)))
+        # A new registration is always later than the one a record is bound to. A row
+        # that goes backwards is a read we cannot trust, so nothing is cleared on it.
+        backwards = [d for d in doomed if d[0] != UNHELD and d[2] < d[0]]
+        deferred = set()
+        if backwards:
+            bt.logging.error(
+                f"[REPUTATION] {len(backwards)} row(s) carry a registration older than "
+                f"the one on record; no record was cleared this pass")
+            deferred = {hk for _, hk, _ in doomed}
+        elif len(doomed) > limit:
+            deferred = {hk for _, hk, _ in doomed[limit:]}
+            bt.logging.warning(
+                f"[REPUTATION] {len(doomed)} record(s) due to clear; clearing the oldest "
+                f"{limit}, the rest next pass")
+
+        for uid, hotkey, reg_block in rows:
+            uid, hotkey, reg_block = int(uid), str(hotkey), int(reg_block)
+            if hotkey in deferred:
+                continue
+            entry = self.state.get(hotkey)
+            prior = next((p for p in by_slot.get((uid, reg_block), [])
+                          if p != hotkey and p in self.state), None)
+            if entry is not None:
+                held = entry.get("b")
+                if held is not None and int(held) != reg_block:
+                    del self.state[hotkey]
+                    cleared += 1
+                    entry = None
+                elif held is not None or prior is None:
+                    if held is None:
+                        adopted += 1
+                    entry["u"], entry["b"] = uid, reg_block
+                    continue
+
+            # The registration's earlier record wins over one opened under the new hotkey
+            # before this pass saw it.
+            if prior is not None:
+                carried = self.state.pop(prior)
+                carried["u"], carried["b"] = uid, reg_block
+                self.state[hotkey] = carried
+                moved += 1
+
+        # A record held by nobody is bound to no registration, so whichever one claims
+        # its hotkey next starts empty.
+        present = {str(hotkey) for _, hotkey, _ in rows}
+        for hotkey, entry in self.state.items():
+            if hotkey not in present and entry.get("b") is None:
+                entry["u"], entry["b"] = UNHELD, UNHELD
+                adopted += 1
+
+        if cleared or moved or adopted:
+            bt.logging.info(
+                f"[REPUTATION] registrations reconciled: {cleared} cleared, {moved} "
+                f"carried, {adopted} bound for the first time")
+            self.save()
+        return cleared, moved
 
     # ---- read ----
     def reputation(self, hotkey: str) -> float:

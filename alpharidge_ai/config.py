@@ -339,6 +339,17 @@ DISPATCH_LATE_FRACTION = float(os.getenv("DISPATCH_LATE_FRACTION", "0.6"))
 # built from that ping, so a shorter ack window systematically fails alive-but-slow
 # miners. (TODO: share one constant with get_alive_uids so they can't drift.)
 DISPATCH_ACK_TIMEOUT_S = float(os.getenv("DISPATCH_ACK_TIMEOUT_S", "12.0"))
+
+# Credit dispatch. "coverage" is the draw this has always used; "credit" serves the
+# miner owed most (see utils/dispatch.credit_select). Shadow logs what credit would
+# assign without assigning it, so the two can be compared on live traffic first. The
+# allocator's own constants live with it; these two are what an operator switches.
+DISPATCH_MODE = os.getenv("DISPATCH_MODE", "coverage")
+DISPATCH_CREDIT_SHADOW = _as_bool(os.getenv("DISPATCH_CREDIT_SHADOW", "false"))
+# Credit-mode dispatch weight for speed: up to +-DISPATCH_SPEED_BONUS of a miner's share,
+# held back while its audited quality trails the field. 0 turns it off.
+DISPATCH_SPEED_BONUS = float(os.getenv("DISPATCH_SPEED_BONUS", "0.0"))
+DISPATCH_QUALITY_GATE_Z = float(os.getenv("DISPATCH_QUALITY_GATE_Z", "3.0"))
 # How long a dispatched article may sit in PROCESSING before it is reclaimed. Both readers
 # (article_store.get_timeouts, cooldown._late_threshold_s) used a hardcoded 900 fallback and it
 # was never declared here. Doubly-loaded: also scales the late-growth threshold (0.6 * TTL),
@@ -444,6 +455,10 @@ _REMOTE_CONFIG_KEYS = {
     "DISPATCH_WINDOW_SHRINK":     (float, "DISPATCH_WINDOW_SHRINK"),
     "DISPATCH_LATE_FRACTION":     (float, "DISPATCH_LATE_FRACTION"),
     "DISPATCH_ACK_TIMEOUT_S":     (float, "DISPATCH_ACK_TIMEOUT_S"),
+    "DISPATCH_MODE":              (str,   "DISPATCH_MODE"),
+    "DISPATCH_CREDIT_SHADOW":     (_as_bool, "DISPATCH_CREDIT_SHADOW"),
+    "DISPATCH_SPEED_BONUS":       (float, "DISPATCH_SPEED_BONUS"),
+    "DISPATCH_QUALITY_GATE_Z":    (float, "DISPATCH_QUALITY_GATE_Z"),
     "SCORING_LEASE_TTL_SECONDS":  (float, "SCORING_LEASE_TTL_SECONDS"),
     "DISPATCH_CHRONIC_TIMEOUT_N": (int,   "DISPATCH_CHRONIC_TIMEOUT_N"),
     "LIVENESS_TTL_S":             (int,   "LIVENESS_TTL_S"),

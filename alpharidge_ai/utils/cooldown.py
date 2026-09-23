@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Dict, Set, Tuple
 
 from alpharidge_ai import config
+from alpharidge_ai.utils.dispatch import CARRY_MAX_BATCHES
 
 
 BACKOFF_SCHEDULE = [30, 60, 120, 300, 600]  # seconds
 CONSECUTIVE_FAILURES_BEFORE_COOLDOWN = 10
 MAX_INFLIGHT_PER_MINER = 4
 LATENCY_WINDOW = 20  # rolling per-miner batch round-trip samples for the median telemetry
+SPEED_SAMPLES_MAX = 200    # per-miner seconds-per-article samples kept for the speed weight
+QUALITY_SAMPLES_MAX = 400  # per-miner audit scores kept for the quality gate
+MIN_TIMED_ARTICLES = 8     # a batch smaller than this says little about speed
 EVENT_BUFFER_MAX = 2000  # bound the display-only event buffer if the API is unreachable
 
 
@@ -49,6 +53,12 @@ class MinerCooldownTracker:
         self._window: Dict[str, float] = {}       # per-miner congestion window
         self._consec_to: Dict[str, int] = {}      # consecutive lease timeouts (non-response)
         self._covered_ep: Dict[str, int] = {}     # last epoch given a coverage batch
+        self._credit: Dict[str, float] = {}       # batches owed under credit dispatch
+        self._last_valid: Dict[str, float] = {}   # last valid push-back, unix seconds
+        self._first_ep: Dict[str, int] = {}       # first epoch this miner was dispatched
+        self._speed: Dict[str, deque] = {}        # (unix, seconds per article), valid batches
+        self._quality: Dict[str, deque] = {}      # (unix, audit score)
+        self._gated_out: Dict[str, bool] = {}     # speed bonus withheld (quality gate)
         self._cap: float = None                   # per-tick anti-monopoly cap; None => from config
 
         # ---- Faithfulness cooldown (2026-07-09) ----
@@ -87,6 +97,12 @@ class MinerCooldownTracker:
                 "inv_until": self._inv_until,
                 "consec_fail": self._consec_fail,
                 "covered_ep": self._covered_ep,
+                "credit": self._credit,
+                "first_ep": self._first_ep,
+                "last_valid": self._last_valid,
+                "speed": {k: list(v) for k, v in self._speed.items()},
+                "quality": {k: list(v) for k, v in self._quality.items()},
+                "gated_out": self._gated_out,
             }))
             tmp.replace(path)
         except Exception as e:
@@ -119,6 +135,14 @@ class MinerCooldownTracker:
             self._inv_until = {k: float(v) for k, v in (raw.get("inv_until") or {}).items()}
             self._consec_fail = {k: int(v) for k, v in (raw.get("consec_fail") or {}).items()}
             self._covered_ep = {k: int(v) for k, v in (raw.get("covered_ep") or {}).items()}
+            self._credit = {k: float(v) for k, v in (raw.get("credit") or {}).items()}
+            self._first_ep = {k: int(v) for k, v in (raw.get("first_ep") or {}).items()}
+            self._last_valid = {k: float(v) for k, v in (raw.get("last_valid") or {}).items()}
+            self._speed = {k: deque(((float(t), float(x)) for t, x in v), maxlen=SPEED_SAMPLES_MAX)
+                           for k, v in (raw.get("speed") or {}).items()}
+            self._quality = {k: deque(((float(t), float(x)) for t, x in v), maxlen=QUALITY_SAMPLES_MAX)
+                             for k, v in (raw.get("quality") or {}).items()}
+            self._gated_out = {k: bool(v) for k, v in (raw.get("gated_out") or {}).items()}
             bt.logging.info(
                 f"[COOLDOWN] restored dispatch state for {len(self._batch_size)} miner(s); "
                 f"mean batch {sum(self._batch_size.values())/max(len(self._batch_size),1):.1f}, "
@@ -261,7 +285,12 @@ class MinerCooldownTracker:
         return max(1, int(math.ceil(ration / max(1, self._bs_max()))))
 
     def record_batch_valid(self, hotkey: str, latency_s: float) -> None:
-        """Grow on an on-time valid return; hold on valid-but-slow. No-op when disabled."""
+        """Grow on an on-time valid return; hold on valid-but-slow.
+
+        The delivery stamp is kept whatever the adaptive flags say: credit dispatch reads
+        it to tell a miner that is working from one that only answers.
+        """
+        self.note_valid(hotkey)
         if not self._bs_active():
             return
         if latency_s is not None and latency_s <= self._late_threshold_s():
@@ -489,6 +518,67 @@ class MinerCooldownTracker:
 
     def mark_covered(self, hotkey: str, epoch: int) -> None:
         self._covered_ep[hotkey] = int(epoch)
+        self._first_ep.setdefault(hotkey, int(epoch))
+
+    # ---- Credit dispatch ----
+
+    def credit(self, hotkey: str) -> float:
+        return float(self._credit.get(hotkey, 0.0))
+
+    def add_credit(self, hotkey: str, amount: float, carry_max: float) -> None:
+        """Accrue what this tick owes a miner, bounded so an absence cannot bank a burst."""
+        if amount <= 0.0:
+            return
+        self._credit[hotkey] = min(float(carry_max),
+                                   self.credit(hotkey) + float(amount))
+
+    def spend_credit(self, hotkey: str, amount: float,
+                     carry_max: float = None) -> None:
+        """Debit a served turn. It may go negative: a miner served before its turn is
+        owed less next time, which is what keeps long-run shares equal."""
+        floor = -float(CARRY_MAX_BATCHES if carry_max is None else carry_max)
+        self._credit[hotkey] = max(floor, self.credit(hotkey) - float(amount))
+
+    def note_valid(self, hotkey: str, when: float = None) -> None:
+        self._last_valid[hotkey] = float(time.time() if when is None else when)
+
+    def record_speed(self, hotkey: str, latency_s: float, n_articles: int,
+                     when: float = None) -> None:
+        """Seconds per article of a valid batch, for the dispatch speed weight."""
+        if latency_s is None or n_articles < MIN_TIMED_ARTICLES or latency_s <= 0:
+            return
+        dq = self._speed.setdefault(hotkey, deque(maxlen=SPEED_SAMPLES_MAX))
+        dq.append((float(time.time() if when is None else when),
+                   float(latency_s) / int(n_articles)))
+
+    def record_quality(self, hotkey: str, score: float, when: float = None) -> None:
+        dq = self._quality.setdefault(hotkey, deque(maxlen=QUALITY_SAMPLES_MAX))
+        dq.append((float(time.time() if when is None else when), float(score)))
+
+    def speed_samples(self, hotkey: str, since: float):
+        return [x for t, x in self._speed.get(hotkey, ()) if t > since]
+
+    def quality_samples(self, hotkey: str, since: float):
+        return [x for t, x in self._quality.get(hotkey, ()) if t > since]
+
+    def gated_out(self, hotkey: str) -> bool:
+        return bool(self._gated_out.get(hotkey, False))
+
+    def set_gated_out(self, hotkey: str, value: bool) -> None:
+        if value:
+            self._gated_out[hotkey] = True
+        else:
+            self._gated_out.pop(hotkey, None)
+
+    def starting_up(self, hotkey: str, epoch: int, trial_epochs: int) -> bool:
+        """Within the allowance a miner gets before its first return is expected."""
+        first = self._first_ep.get(hotkey)
+        return first is None or (int(epoch) - int(first)) <= int(trial_epochs)
+
+    def delivered_since(self, hotkey: str, seconds: float) -> bool:
+        """Whether this miner has returned valid work recently enough to be owed more."""
+        last = self._last_valid.get(hotkey)
+        return last is not None and (time.time() - float(last)) <= float(seconds)
 
     # ---- Reconciliation (anti-leak; RFC Component 2) ----
 
@@ -557,7 +647,9 @@ class MinerCooldownTracker:
         stale_inflight = [hk for hk in self._inflight if hk not in active_hotkeys]
         for hk in stale_inflight:
             del self._inflight[hk]
-        for d in (self._window, self._consec_to, self._covered_ep,
+        for d in (self._credit, self._last_valid, self._first_ep,
+                  self._speed, self._quality, self._gated_out,
+                  self._window, self._consec_to, self._covered_ep,
                   self._consec_inv, self._inv_level, self._inv_until, self._last_faith,
                   self._batch_size, self._consec_fail, self._latency):
             for hk in [h for h in d if h not in active_hotkeys]:

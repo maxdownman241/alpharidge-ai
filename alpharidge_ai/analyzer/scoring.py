@@ -1631,6 +1631,31 @@ def _reference_analysis(analyzer, auditor, article, src, block: int):
         reference=True, **kwargs)
 
 
+def _keyed_order(auditor, batch):
+    """The batch in the auditor's keyed order.
+
+    Falling back to the order it arrived in is the one outcome worth seeing in the log:
+    it is silent otherwise, and it is not the order the audit is meant to use.
+    """
+    missed = []
+
+    def key(article):
+        try:
+            return (auditor.order_key(int(getattr(article, "id", 0))), 0)
+        except Exception:
+            missed.append(1)
+            return (1.0, 1)
+    try:
+        ordered = sorted(batch or (), key=key)
+    except Exception:
+        ordered = list(batch or ())
+        missed = [1] * len(ordered)
+    if ordered and len(missed) == len(ordered):
+        bt.logging.debug(f"[AUDIT] keyed order unavailable for {len(ordered)} article(s); "
+                         f"batch order kept")
+    return ordered
+
+
 def _log_stock_anchor(auditor, article_id, text, stock_intel, reference, block: int):
     """Score the validator's own default analysis as a submission would be. Report only."""
     try:
@@ -1643,7 +1668,8 @@ def _log_stock_anchor(auditor, article_id, text, stock_intel, reference, block: 
     if observed is not None:
         bt.logging.info(
             f"[ANCHOR] kind=stock id={observed.article_id} path={observed.path} "
-            f"model={observed.grader_model} score={observed.score:.3f} {observed.detail}")
+            f"model={observed.grader_model} score={observed.score:.3f} {observed.detail}"
+            f"{'' if observed.score_v2 is None else f' v2={observed.score_v2:.3f}'}")
     return observed
 
 
@@ -1826,7 +1852,7 @@ def validate_miner_article_intelligence_batch(
         budget = 2 * cap
         picked = 0
         spent = 0
-        for article in miner_batch:
+        for article in _keyed_order(auditor, miner_batch):
             if picked >= cap or spent >= budget:
                 bt.logging.debug(
                     f"[AUDIT] per-batch cap {cap} reached; "

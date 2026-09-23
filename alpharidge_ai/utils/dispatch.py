@@ -20,6 +20,7 @@ covered without sending it work. ``provisional`` mirrors what those acquisitions
 will be so we don't assign a miner more than ``floor(window)`` within one tick.
 """
 
+import math
 import random
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -98,3 +99,201 @@ def coverage_depth_select(
                 break  # every live window is full; remaining batches retry next tick
 
     return assignments
+
+
+# ---- Credit allocator ---------------------------------------------------------------
+
+CARRY_MAX_BATCHES = 2.0
+# Rate a miner outside the recency gate accrues at, so one that has stopped can be
+# re-measured without being owed a full share.
+FLOOR_FRAC = 0.05
+# A miner is owed a share while it is returning work, or while it is still starting up.
+# Long enough that an outage does not cost a miner its place in the rotation.
+RECENCY_S = 28800.0
+TRIAL_EPOCHS = 3
+# A miner sent nothing for this long is owed a share again, so one coming back from an
+# outage is re-measured within the hour instead of waiting on the floor slice.
+PROBE_EPOCHS = 6
+
+
+def owed_share(tracker, hotkey: str, epoch: int) -> bool:
+    """Whether a miner accrues a full share: returning work, starting up, or due a probe."""
+    return (tracker.delivered_since(hotkey, RECENCY_S)
+            or tracker.starting_up(hotkey, epoch, TRIAL_EPOCHS)
+            or int(epoch) - int(tracker.covered_epoch(hotkey)) > PROBE_EPOCHS)
+
+
+def credit_select(
+    live_uids: Sequence[int],
+    hotkeys: Sequence[str],
+    tracker,
+    n_batches: int,
+    *,
+    weight_of=None,
+    cap: Optional[float] = None,
+    floor_frac: float = 0.0,
+    eligible=None,
+    carry_max: float = CARRY_MAX_BATCHES,
+) -> List[Tuple[int, int]]:
+    """Assign this tick's batches by turn owed rather than by draw.
+
+    Every miner is owed a share of each tick; whoever is owed most is served first, and
+    an unserved turn stays owed, bounded. `weight_of` scales a miner's share (default:
+    equal), `cap` bounds it as a multiple of the average, and a miner outside `eligible`
+    accrues at `floor_frac` of the normal rate, so one that has stopped delivering can
+    still be re-measured without being owed a full share.
+
+    Read-only on the tracker apart from the credit it keeps: the reservation stays with
+    the validator's dispatch coroutine, as in coverage_depth_select.
+    """
+    if n_batches <= 0 or not live_uids:
+        return []
+
+    uids = [u for u in live_uids if 0 <= u < len(hotkeys)]
+    if not uids:
+        return []
+
+    weights = {}
+    for u in uids:
+        hk = hotkeys[u]
+        try:
+            w = float(weight_of(hk)) if weight_of else 1.0
+        except Exception:
+            w = 1.0
+        if eligible is not None and not eligible(hk):
+            w *= max(0.0, float(floor_frac))
+        weights[u] = max(0.0, w)
+
+    total = sum(weights.values())
+    if total <= 0.0:
+        weights = {u: 1.0 for u in uids}
+        total = float(len(uids))
+    if cap and cap > 0:
+        ceiling = float(cap) * total / len(uids)
+        weights = {u: min(w, ceiling) for u, w in weights.items()}
+        total = sum(weights.values()) or 1.0
+
+    for u in uids:
+        tracker.add_credit(hotkeys[u], n_batches * weights[u] / total, carry_max)
+
+    pending: Dict[str, int] = {}
+
+    def free(uid: int) -> bool:
+        hk = hotkeys[uid]
+        return tracker.inflight(hk) + pending.get(hk, 0) < _slot_limit(tracker, hk)
+
+    assignments: List[Tuple[int, int]] = []
+
+    def serve(uid: int) -> None:
+        tracker.spend_credit(hotkeys[uid], 1.0, carry_max)
+        pending[hotkeys[uid]] = pending.get(hotkeys[uid], 0) + 1
+        assignments.append((uid, len(assignments)))
+
+    # Most owed first; hotkey breaks ties so priority never tracks UID. Every batch goes
+    # out: the owed are served first, then the same order fills what is left. Serving
+    # early is debited, so a turn taken now is one not owed later.
+    order = sorted(uids, key=lambda x: (-tracker.credit(hotkeys[x]), hotkeys[x]))
+    for uid in order:
+        while len(assignments) < n_batches and tracker.credit(hotkeys[uid]) >= 1.0:
+            if not free(uid):
+                break
+            serve(uid)
+    while len(assignments) < n_batches:
+        progressed = False
+        for uid in order:
+            if len(assignments) >= n_batches:
+                break
+            if free(uid):
+                serve(uid)
+                progressed = True
+        if not progressed:
+            break
+
+    return assignments
+
+
+# ---- Speed weight --------------------------------------------------------------------
+
+SPEED_WINDOW_S = 48 * 3600.0
+# Log speed ratio to the field median that earns the full bonus.
+SPEED_SPAN = 0.35
+MIN_SPEED_SAMPLES = 10
+MIN_QUALITY_SAMPLES = 40
+MIN_FIELD_QUALITY_SAMPLES = 10
+# Hysteresis on the quality gate, in standard errors.
+GATE_REOPEN_MARGIN = 1.0
+
+
+def speed_weights(tracker, hotkeys: Sequence[str], bonus: float, gate_z: float,
+                  now: float) -> Dict[str, float]:
+    """Dispatch weight per hotkey: a bonus of up to +-`bonus` for speed relative to the
+    field, paid only while the miner's audited quality is not clearly below the field's.
+
+    A miner below the field by more than `gate_z` standard errors is held at the bottom
+    of the band however fast it is. Too little history reads as neutral. Updates the
+    tracker's gate state.
+    """
+    if bonus <= 0.0:
+        return {}
+    since = now - SPEED_WINDOW_S
+    speed, quality = {}, {}
+    for hk in hotkeys:
+        xs = tracker.speed_samples(hk, since)
+        if len(xs) >= MIN_SPEED_SAMPLES:
+            xs = sorted(xs)
+            speed[hk] = xs[len(xs) // 2]
+        qs = tracker.quality_samples(hk, since)
+        if qs:
+            quality[hk] = qs
+    field_means = sorted(sum(q) / len(q) for q in quality.values()
+                         if len(q) >= MIN_FIELD_QUALITY_SAMPLES)
+    if not speed or not field_means:
+        return {}
+    field_speed = sorted(speed.values())[len(speed) // 2]
+    field_q = field_means[len(field_means) // 2]
+    pooled = [x for q in quality.values() for x in q]
+    mean = sum(pooled) / len(pooled)
+    sd = (sum((x - mean) ** 2 for x in pooled) / len(pooled)) ** 0.5 or 1.0
+
+    out = {}
+    for hk, spa in speed.items():
+        qs = quality.get(hk, [])
+        if len(qs) < MIN_QUALITY_SAMPLES or spa <= 0.0:
+            continue
+        z = (sum(qs) / len(qs) - field_q) / (sd / len(qs) ** 0.5)
+        if z < -gate_z:
+            tracker.set_gated_out(hk, True)
+        elif z > -(gate_z - GATE_REOPEN_MARGIN):
+            tracker.set_gated_out(hk, False)
+        if tracker.gated_out(hk):
+            out[hk] = 1.0 - bonus
+        else:
+            lean = max(-1.0, min(1.0, math.log(field_speed / spa) / SPEED_SPAN))
+            out[hk] = 1.0 + bonus * lean
+    return out
+
+
+class ShadowCredit:
+    """A tracker view that keeps its own credit, for running credit dispatch alongside.
+
+    Everything else (in-flight, slot limits, coverage) reads through to the real
+    tracker, so the shadow sees the same constraints without touching its state.
+    """
+
+    def __init__(self, tracker, credit_state: Dict[str, float]):
+        self._tracker = tracker
+        self._credit = credit_state
+
+    def __getattr__(self, name):
+        return getattr(self._tracker, name)
+
+    def credit(self, hotkey: str) -> float:
+        return float(self._credit.get(hotkey, 0.0))
+
+    def add_credit(self, hotkey: str, amount: float, carry_max: float) -> None:
+        if amount > 0.0:
+            self._credit[hotkey] = min(float(carry_max), self.credit(hotkey) + float(amount))
+
+    def spend_credit(self, hotkey: str, amount: float, carry_max: float = None) -> None:
+        floor = -float(CARRY_MAX_BATCHES if carry_max is None else carry_max)
+        self._credit[hotkey] = max(floor, self.credit(hotkey) - float(amount))

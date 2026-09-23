@@ -31,6 +31,7 @@ from alpharidge_ai.analyzer import setup_article_intelligence_analyzer
 import alpharidge_ai.protocol
 from alpharidge_ai import config
 from alpharidge_ai.mechanism import channels
+from alpharidge_ai.mechanism import profile as mprofile
 from alpharidge_ai.oracle.selector import KEEPER as KEEPER_PATH, POOL as POOL_PATH
 from alpharidge_ai.analyzer.aspect_sentiment import install_meta_init_guard
 
@@ -52,7 +53,9 @@ from alpharidge_ai.utils.api_models import TweetWithAuthor, CompletedTweetSubmis
 from alpharidge_ai.protocol import TweetBatch, TelegramBatch, ArticleBatch
 from alpharidge_ai.utils.uids import get_random_uids, get_alive_uids
 from alpharidge_ai.utils.liveness import LivenessRoster
-from alpharidge_ai.utils.dispatch import coverage_depth_select
+from alpharidge_ai.utils.dispatch import (CARRY_MAX_BATCHES, FLOOR_FRAC, ShadowCredit,
+                                          coverage_depth_select, credit_select,
+                                          owed_share, speed_weights)
 from alpharidge_ai.utils.dispatch_metrics import AdaptiveDispatchMetrics
 from alpharidge_ai.utils.tweet_store import TweetStore
 from alpharidge_ai.utils.telegram_store import TelegramStore
@@ -79,6 +82,12 @@ from alpharidge_ai.validator.triage_grader import (
 
 # Triage design constants — one instance, no env var or served key behind it.
 TRIAGE_CFG = TriageConfig()
+
+# Ticks between shadow-dispatch spread reports (about an hour of ticks).
+SHADOW_REPORT_TICKS = 180
+
+# Above this, a tick reaches too few miners for turns to even out.
+CREDIT_MAX_BATCH_SIZE = 32
 from alpharidge_ai.analyzer import setup_telegram_analyzer
 from alpharidge_ai.utils.cooldown import MinerCooldownTracker
 from alpharidge_ai.validator.verdict_payload import build_verdict_fields, collect_verdict_meta  # T5: verdict payload
@@ -159,6 +168,9 @@ class Validator(BaseValidatorNeuron):
         self._graded_scorer = None  # lazy; built on first use when scoring is served on
         self._auditor = None        # lazy; built on first use when shadow auditing is on
         self._ration_plan = {}      # this tick's rations; empty leaves dispatch as-is
+        # Credit dispatch shadow: its own credit, and what each dispatcher served.
+        self._shadow_credit_state = {}
+        self._shadow_served, self._live_served, self._shadow_ticks = {}, {}, 0
         # Transient per-item verdict metadata (resource_id -> {miner_signature, nonce,
         # validator_verdict, epoch}); populated during validation, drained at submission.
         self._verdict_meta = {}
@@ -829,11 +841,16 @@ class Validator(BaseValidatorNeuron):
         fleet-wide within an epoch and cannot be undone.
         """
         for obs in observations or []:
+            v2 = getattr(obs, "score_v2", None)
             bt.logging.info(
                 f"[AUDIT] hk={miner_hotkey[:12]}.. id={obs.article_id} "
                 f"path={obs.path} score={obs.score:.3f} w={obs.weight:.2f} "
                 f"model={obs.grader_model} {obs.detail}"
+                f"{'' if v2 is None else f' v2={v2:.3f}'}"
                 f"{'' if live else ' (shadow)'}")
+            if obs.path == POOL_PATH:
+                self._article_cooldown.record_quality(
+                    miner_hotkey, float(obs.score if v2 is None else v2))
         if live and observations:
             for path, channel in ((POOL_PATH, channels.AUDIT), (KEEPER_PATH, channels.KEEPER)):
                 self._record_observations(
@@ -841,6 +858,18 @@ class Validator(BaseValidatorNeuron):
                     [(o.article_id, float(o.score), float(o.weight))
                      for o in observations if o.path == path],
                     channel)
+            try:
+                v2_live = mprofile.records(
+                    self._mechanism_profile.resolve(int(self.block)), channels.AUDIT_V2)
+            except Exception:
+                v2_live = False
+            if v2_live:
+                self._record_observations(
+                    miner_hotkey,
+                    [(o.article_id, float(o.score_v2), float(o.weight))
+                     for o in observations
+                     if o.path == POOL_PATH and getattr(o, "score_v2", None) is not None],
+                    channels.AUDIT_V2)
 
     def _ration_for(self, hotkey):
         """This UID's earned ration for the current epoch, or None to leave dispatch
@@ -858,6 +887,7 @@ class Validator(BaseValidatorNeuron):
             if profile is None or not profile.rations.dispatch:
                 self._ration_plan = {}
                 return
+            self._warn_rations_bypassed()
             epoch = int(self._miner_reward._get_current_epoch())
             self._ration_plan = self._ration_store.plan(
                 list(hotkeys), epoch=epoch, supply=float(supply), profile=profile)
@@ -1669,6 +1699,8 @@ class Validator(BaseValidatorNeuron):
             self._adaptive_metrics.incr("valid")
             self._adaptive_metrics.mark_scored(miner_hotkey)
         self._article_cooldown.record_batch_valid(miner_hotkey, latency_s)
+        if not verification and deep_validated:
+            self._article_cooldown.record_speed(miner_hotkey, latency_s, len(sent_batch))
         gated_out = self._credit_gate(miner_hotkey, article_batch, validation_result)
 
         if triage_active and verification:
@@ -1789,14 +1821,17 @@ class Validator(BaseValidatorNeuron):
             cursor = 0
             for uid, _placeholder in ordered:
                 if cursor >= len(articles):
-                    break
+                    self._refund_credit(uid)
+                    continue
                 try:
                     hk = self.metagraph.hotkeys[int(uid)]
                 except Exception:
+                    self._refund_credit(uid)
                     continue
                 miner_batch = articles[cursor:cursor + self._article_cooldown.batch_size(hk)]
                 if not miner_batch:
-                    break
+                    self._refund_credit(uid)
+                    continue
                 cursor += len(miner_batch)
                 targets.append((int(uid), miner_batch))
         else:
@@ -1833,14 +1868,17 @@ class Validator(BaseValidatorNeuron):
             if not self._liveness.is_alive(hk):
                 continue
             eligible.append(u)
-        for uid, miner_batch in targets:
+        for _i, (uid, miner_batch) in enumerate(targets):
             if len(self._pending_miner_tasks) >= self._max_pending_miner_tasks:
                 bt.logging.warning(
                     f"[VALIDATION] Too many pending miner dispatch tasks ({len(self._pending_miner_tasks)}); "
                     f"skipping scheduling remaining article batches this tick."
                 )
+                for dropped, _batch in targets[_i:]:
+                    self._refund_credit(dropped)
                 break
             miner_batch = list(miner_batch)
+            self._count_live_served([(uid, miner_batch)])
             self._inject_canaries(miner_batch, canary_rng, charge=overlap_k)
             pool = [u for u in eligible if u != int(uid)]
             n_verify = min(overlap_k - 1, len(pool)) if overlap_k > 1 else 0
@@ -1947,6 +1985,179 @@ class Validator(BaseValidatorNeuron):
             })
         return rows
 
+    def _identity_rows(self, epoch=None):
+        """(uid, hotkey, registration block) for the field as of the epoch being scored.
+
+        Read from the live metagraph; a registration made after that epoch is left for a
+        later pass. Seats are immune for longer than the settlement lag, so what remains
+        is the same for both validators without a historical query.
+        """
+        rows = []
+        try:
+            hotkeys = list(self.metagraph.hotkeys)
+            blocks = list(getattr(self.metagraph, "block_at_registration", []) or [])
+            for uid, hotkey in enumerate(hotkeys):
+                if uid < len(blocks):
+                    rows.append((uid, hotkey, int(blocks[uid])))
+        except Exception as e:
+            bt.logging.debug(f"[REPUTATION] identity rows unavailable: {e}")
+            return []
+        if epoch is not None:
+            end = (int(epoch) + 1) * int(config.BLOCK_LENGTH)
+            rows = [r for r in rows if r[2] <= end]
+        return rows
+
+    def _warn_credit_unreachable(self) -> None:
+        """Credit mode does nothing while dispatch selection is the random draw."""
+        warned = getattr(self, "_credit_warned", set())
+        if "adaptive" not in warned:
+            warned.add("adaptive")
+            bt.logging.warning(
+                "[DISPATCH] DISPATCH_MODE=credit but ADAPTIVE_DISPATCH_ENABLED is off; "
+                "selection stays random")
+        self._credit_warned = warned
+
+    def _warn_credit_preconditions(self) -> None:
+        """Say so when the settings around credit dispatch contradict it. Once each."""
+        warned = getattr(self, "_credit_warned", set())
+        if getattr(config, "ADAPTIVE_BATCH_SIZE_ENABLED", False) and "batch" not in warned:
+            warned.add("batch")
+            bt.logging.warning(
+                "[DISPATCH] credit mode with adaptive batch size on: batches differ in "
+                "size, so equal turns are not equal work")
+        size = int(getattr(config, "MINER_BATCH_SIZE", 12) or 12)
+        if size > CREDIT_MAX_BATCH_SIZE and "size" not in warned:
+            warned.add("size")
+            bt.logging.warning(
+                f"[DISPATCH] credit mode at MINER_BATCH_SIZE={size}: too few miners are "
+                f"served per tick for turns to even out (expected "
+                f"<= {CREDIT_MAX_BATCH_SIZE})")
+        self._credit_warned = warned
+
+    def _warn_rations_bypassed(self) -> None:
+        """Rations size batches only on the adaptive-batch path, and credit mode shares
+        turns on its own terms. Say so once when a profile turns rations on regardless."""
+        credit = str(getattr(config, "DISPATCH_MODE", "coverage") or "").lower() == "credit"
+        adaptive_batch = bool(getattr(config, "ADAPTIVE_BATCH_SIZE_ENABLED", False))
+        if not credit and adaptive_batch:
+            return
+        warned = getattr(self, "_credit_warned", set())
+        if "rations" not in warned:
+            warned.add("rations")
+            bt.logging.warning(
+                "[RATION] the profile turns ration dispatch on, but "
+                + ("credit mode allocates turns itself" if credit else
+                   "ADAPTIVE_BATCH_SIZE_ENABLED is off")
+                + "; rations are not applied to dispatch")
+        self._credit_warned = warned
+
+    def _refund_credit(self, uid) -> None:
+        """Give back a turn that was allocated but never sent.
+
+        Credit is spent when a batch is allocated; anything that stops it reaching the
+        miner has to put it back, or the turn is lost and shares drift."""
+        if str(getattr(config, "DISPATCH_MODE", "coverage") or "").lower() != "credit":
+            return
+        try:
+            self._article_cooldown.add_credit(
+                self.metagraph.hotkeys[int(uid)], 1.0, CARRY_MAX_BATCHES)
+        except Exception:
+            pass
+
+    def _dispatch_eligible(self, epoch):
+        """Which miners are owed a share: those returning work, those still starting,
+        and those not sent anything for a while.
+
+        A miner that answers but never delivers keeps holding batches otherwise; it
+        falls back to the exploration slice between probes.
+        """
+        tracker = self._article_cooldown
+        return lambda hotkey: owed_share(tracker, hotkey, epoch)
+
+    def _credit_args(self, epoch):
+        args = dict(floor_frac=FLOOR_FRAC, eligible=self._dispatch_eligible(epoch))
+        bonus = float(getattr(config, "DISPATCH_SPEED_BONUS", 0.0) or 0.0)
+        if bonus > 0.0:
+            weights = speed_weights(
+                self._article_cooldown, list(self.metagraph.hotkeys), min(bonus, 0.5),
+                float(getattr(config, "DISPATCH_QUALITY_GATE_Z", 3.0)), time.time())
+            args["weight_of"] = lambda hk: weights.get(hk, 1.0)
+            self._speed_ticks = getattr(self, "_speed_ticks", 0) + 1
+            if weights and self._speed_ticks % SHADOW_REPORT_TICKS == 1:
+                held = sum(1 for hk in weights if self._article_cooldown.gated_out(hk))
+                bt.logging.info(
+                    f"[DISPATCH] speed weight: {len(weights)} miner(s) weighted, {held} held "
+                    f"by the quality gate, range {min(weights.values()):.3f}-"
+                    f"{max(weights.values()):.3f}")
+        return args
+
+    def _credit_assign(self, live, hotkeys, tracker, epoch, n_batches):
+        assignments = credit_select(live, hotkeys, tracker, n_batches,
+                                    **self._credit_args(epoch))
+        if len(assignments) < n_batches:
+            bt.logging.info(
+                f"[DISPATCH] credit: {n_batches - len(assignments)}/{n_batches} batch(es) "
+                f"unassigned this tick (no free slots); they retry next tick.")
+        return assignments
+
+    def _shadow_credit(self, live, hotkeys, epoch, n_batches, live_assignments):
+        """Log what credit dispatch would have done, without doing it."""
+        if not getattr(config, "DISPATCH_CREDIT_SHADOW", False):
+            return
+        try:
+            shadow = ShadowCredit(self._article_cooldown, self._shadow_credit_state)
+            would = credit_select(live, hotkeys, shadow, n_batches,
+                                  **self._credit_args(epoch))
+            served = {u for u, _ in would}
+            actual = {u for u, _ in live_assignments}
+            # A credit turn carries one MINER_BATCH_SIZE batch; live is counted from what
+            # was actually sliced and sent (_count_live_served), so both are articles.
+            size = max(1, int(getattr(config, "MINER_BATCH_SIZE", 12) or 12))
+            for u, _ in would:
+                self._shadow_served[hotkeys[u]] = self._shadow_served.get(hotkeys[u], 0) + size
+            bt.logging.debug(
+                f"[DISPATCH] credit shadow: {len(would)} batch(es) across {len(served)} "
+                f"miner(s); {len(served & actual)} also served live")
+            self._shadow_ticks += 1
+            if self._shadow_ticks % SHADOW_REPORT_TICKS == 0:
+                self._log_shadow_spread(live, hotkeys)
+        except Exception as e:
+            bt.logging.debug(f"[DISPATCH] credit shadow failed: {e}")
+
+    def _count_live_served(self, targets):
+        """Articles each miner was actually sent this tick, for the shadow comparison."""
+        if (not getattr(config, "DISPATCH_CREDIT_SHADOW", False)
+                or str(getattr(config, "DISPATCH_MODE", "coverage") or "").lower() == "credit"):
+            return
+        for uid, batch in targets:
+            try:
+                hk = self.metagraph.hotkeys[int(uid)]
+            except Exception:
+                continue
+            self._live_served[hk] = self._live_served.get(hk, 0) + len(batch)
+
+    def _log_shadow_spread(self, live, hotkeys):
+        """How evenly each dispatcher spread work over the reporting period."""
+        def spread(counts):
+            served = [counts.get(hotkeys[u], 0) for u in live]
+            if not served:
+                return 0.0, 0, 0
+            mean = sum(served) / len(served)
+            if mean <= 0:
+                return 0.0, 0, 0
+            var = sum((x - mean) ** 2 for x in served) / len(served)
+            return (var ** 0.5) / mean, min(served), max(served)
+
+        live_cv, live_lo, live_hi = spread(self._live_served)
+        shadow_cv, shadow_lo, shadow_hi = spread(self._shadow_served)
+        bt.logging.info(
+            f"[DISPATCH] credit shadow over {self._shadow_ticks} tick(s), articles per miner: "
+            f"spread live {live_cv:.2f} (min {live_lo}, max {live_hi}) vs "
+            f"credit at batch {max(1, int(getattr(config, 'MINER_BATCH_SIZE', 12) or 12))} "
+            f"{shadow_cv:.2f} (min {shadow_lo}, max {shadow_hi})")
+        self._live_served, self._shadow_served = {}, {}
+        self._shadow_ticks = 0
+
     def _select_article_targets(self, miner_batches, exclude):
         """
         Choose (uid, batch) dispatch targets.
@@ -1959,6 +2170,8 @@ class Validator(BaseValidatorNeuron):
         """
         n_batches = len(miner_batches)
         if not getattr(config, "ADAPTIVE_DISPATCH_ENABLED", False):
+            if str(getattr(config, "DISPATCH_MODE", "") or "").lower() == "credit":
+                self._warn_credit_unreachable()
             uids = list(get_random_uids(self, k=n_batches, exclude=exclude))
             return [(int(u), b) for b, u in zip(miner_batches, uids)]
 
@@ -1989,7 +2202,15 @@ class Validator(BaseValidatorNeuron):
         self._article_cooldown.set_cap(max(w_min, cap_pct * budget))
 
         epoch = self._current_epoch()
-        assignments = coverage_depth_select(live, hotkeys, self._article_cooldown, epoch, n_batches)
+        mode = str(getattr(config, "DISPATCH_MODE", "coverage") or "coverage").lower()
+        if mode == "credit":
+            self._warn_credit_preconditions()
+            assignments = self._credit_assign(live, hotkeys, self._article_cooldown,
+                                              epoch, n_batches)
+        else:
+            assignments = coverage_depth_select(live, hotkeys, self._article_cooldown,
+                                                epoch, n_batches)
+            self._shadow_credit(live, hotkeys, epoch, n_batches, assignments)
 
         n_assigned = len(assignments)
         if n_assigned < n_batches:
@@ -2052,6 +2273,7 @@ class Validator(BaseValidatorNeuron):
         except Exception:
             pass
         if hotkey and not self._article_cooldown.try_acquire(hotkey):
+            self._refund_credit(uid)
             for article in miner_batch:
                 try:
                     self._article_store.reset_to_unprocessed(article.id)
