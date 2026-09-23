@@ -126,11 +126,12 @@ class TriageStage:
         if bool(_FINANCIAL_TERMS.search(text)):
             return build_triage_record(LABEL_BORDERLINE, confidence=0.55), proof, []
 
-        # Default: no financial signal found -> irrelevant.
-        # Returning as irrelevant avoids Stage 3 LLM (which demands a "financial
-        # implication") being run on sports/politics/general articles. Stage 3 on
-        # non-financial content hallucinates financial claims that are not in the
-        # article body, collapsing the faithfulness groundedness score to ~0 and
-        # pulling the graded score — and therefore reputation — to the floor.
-        return (build_triage_record(LABEL_IRRELEVANT, "non_economic", confidence=0.8),
+        # Default: label relevant so every article gets full V2 analysis.
+        # - IRRELEVANT → triage blob → ArticleIntelligence(**blob) fails →
+        #   invalid_analysis_data → batch rejected → zero reputation credit
+        # - BORDERLINE → borderline_cap=3 means excess become IRRELEVANT →
+        #   analysis_on_nonrelevant penalty per excess article
+        # - RELEVANT → full V2 → only risk is triage_false_positive (soft)
+        #   on genuinely non-financial articles — batch still passes
+        return (build_triage_record(LABEL_RELEVANT, confidence=0.3),
                 proof, [])
