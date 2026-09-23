@@ -165,6 +165,8 @@ testing/
 .vscode/settings.json
 
 # Local subnet runtime/config/state (do not commit)
+miners.yaml
+logs/miners/
 .miner_env
 .vali_env
 .tweet_store.json

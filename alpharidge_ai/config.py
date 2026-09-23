@@ -18,29 +18,36 @@ import os
 # This file is at alpharidge_ai_subnet/alpharidge_ai/config.py
 _SUBNET_ROOT = Path(__file__).resolve().parent.parent
 
-# Paths to environment files
-_MINER_ENV_PATH = _SUBNET_ROOT / ".miner_env"
-_VALI_ENV_PATH = _SUBNET_ROOT / ".vali_env"
+# Paths to environment files.
+# Override via MINER_ENV_FILE / VALI_ENV_FILE so multiple miners can share one
+# repo clone while each process loads its own env file:
+#   MINER_ENV_FILE=.miner_env_1 python -m neurons.miner --wallet.hotkey hotkey1 ...
+#   MINER_ENV_FILE=.miner_env_2 python -m neurons.miner --wallet.hotkey hotkey2 ...
+_MINER_ENV_PATH = Path(os.environ.get("MINER_ENV_FILE", str(_SUBNET_ROOT / ".miner_env")))
+_VALI_ENV_PATH  = Path(os.environ.get("VALI_ENV_FILE",  str(_SUBNET_ROOT / ".vali_env")))
 
-# Load environment files
+# Load environment files.
+# override=False: shell-level env vars (exported before launch) always win over
+# the file, so you can also inject any key directly:
+#   API_KEY=sk-or-xxx python -m neurons.miner ...
 try:
     from dotenv import load_dotenv
-    
+
     # Load miner env file (if it exists)
     if _MINER_ENV_PATH.exists():
-        load_dotenv(str(_MINER_ENV_PATH), override=True)
+        load_dotenv(str(_MINER_ENV_PATH), override=False)
         print(f"[CONFIG] Loaded {_MINER_ENV_PATH}")
     else:
         print(f"[CONFIG] Warning: {_MINER_ENV_PATH} not found")
-    
+
     # Load validator env file (if it exists)
     # Note: validator vars will override miner vars if both exist
     if _VALI_ENV_PATH.exists():
-        load_dotenv(str(_VALI_ENV_PATH), override=True)
+        load_dotenv(str(_VALI_ENV_PATH), override=False)
         print(f"[CONFIG] Loaded {_VALI_ENV_PATH}")
     else:
         print(f"[CONFIG] Warning: {_VALI_ENV_PATH} not found")
-        
+
 except ImportError:
     print("[CONFIG] Warning: python-dotenv not installed, using system environment variables only")
 
@@ -160,6 +167,20 @@ MANUAL_VALIDATOR_HOTKEYS = [hk.strip() for hk in os.getenv("MANUAL_VALIDATOR_HOT
 API_ATTESTATION_PUBKEY = os.getenv("API_ATTESTATION_PUBKEY", "5DqYRNaJ9FJ2cuJTFxbU5HDLeeotpgj6Zgkrkw4RgS6SA4nf")
 DEEP_VERIFY_SAMPLE_RATE = float(os.getenv("DEEP_VERIFY_SAMPLE_RATE", "0.1"))
 ENFORCE_SIGNED_ATTESTATIONS = os.getenv("ENFORCE_SIGNED_ATTESTATIONS", "true").lower() == "true"
+
+# ============================================================================
+# NLP Server (centralised GPU inference for multi-miner deployments)
+# ============================================================================
+# When NLP_SERVER_URL is set (non-empty), miners skip loading local GPU models
+# and call the remote NLP server for Stage 1 inference (NER + embeddings).
+# Each miner still calls OpenRouter with its own API_KEY for Stage 2/3 (LLM).
+#
+# Example: NLP_SERVER_URL=http://192.168.1.10:8765
+# Leave empty (default) to use local models as before.
+NLP_SERVER_URL = os.getenv("NLP_SERVER_URL", "")
+# HTTP timeout (seconds) for calls to the NLP server.  NER on a 4 000-char
+# article takes ~1 s on an 8 GB GPU; under queue pressure allow up to 120 s.
+NLP_SERVER_TIMEOUT = float(os.getenv("NLP_SERVER_TIMEOUT", "120.0"))
 
 
 # ============================================================================
