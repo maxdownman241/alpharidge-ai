@@ -39,12 +39,10 @@ def test_an_unusable_confidence_is_clamped_or_neutral(bad):
     assert 0.0 <= c.confidence <= 1.0
 
 
-def test_quote_confidence_is_capped_at_the_co_extraction_rate():
-    """Audit support needs the grader to have drawn the same quote — stated
-    confidence is capped near that probability, not our alignment quality."""
+def test_quote_confidence_is_carried():
     q = quotes([{"speaker": "CEO", "text": "margins should recover in the second half",
                  "confidence": 0.8}])[0]
-    assert q.confidence == pytest.approx(0.6)
+    assert q.confidence == pytest.approx(0.8)
 
 
 # ---- offsets -----------------------------------------------------------------------

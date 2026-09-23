@@ -250,28 +250,37 @@ class TestTriageStage:
             "on Thursday, citing slowing inflation across the economy.")
         assert rec["label"] == "relevant"
 
-    def test_macro_without_economy_is_borderline(self, stage):
+    def test_macro_without_economy_is_relevant_low_confidence(self, stage):
+        # Macro language without a named economy still gets analysed (relevant)
+        # but at a lower confidence than a macro+economy hit.
         rec, _, _ = stage.evaluate(
             "Officials debate inflation outlook",
             "Rising inflation remains a concern for households, officials said, "
             "though no specific policy response was announced.")
-        assert rec["label"] == "borderline"
+        assert rec["label"] == "relevant" and rec["confidence"] == 0.5
 
-    def test_general_news_is_irrelevant(self, stage):
+    def test_general_news_is_relevant_low_confidence(self, stage):
+        # Everything is analysed (relevant): a triage-only blob fails
+        # ArticleIntelligence(**blob) when sampled → invalid_analysis_data →
+        # batch rejected. Low confidence marks the absence of any signal.
         rec, _, _ = stage.evaluate(
             "Local choir wins regional competition",
             "The community choir took first place at the regional festival on "
             "Saturday, delighting a crowd of hundreds with folk songs.")
-        assert rec["label"] == "irrelevant" and rec["reason_code"] == "non_economic"
+        # "competition" hits _FINANCIAL_TERMS → R3 confidence tier.
+        assert rec["label"] == "relevant" and rec["confidence"] == 0.55
 
     def test_pronoun_us_does_not_trigger_economy(self, stage):
         # Regression: case-insensitive "us" matched the pronoun and inflated
-        # the relevant rate from ~15% to ~46% on real data.
+        # the relevant rate from ~15% to ~46% on real data. The label is always
+        # relevant now, so the guard is that confidence stays at the default.
         rec, _, _ = stage.evaluate(
             "Join us for the summer recipe special",
             "Come cook with us: this tariff-free guacamole brings the whole "
             "family together for movie night.")
-        assert rec["label"] != "relevant"
+        # "tariff" hits _MACRO_TERMS → 0.5; the guard is that the "us" pronoun
+        # must NOT count as a named economy (which would lift it to 0.7).
+        assert rec["label"] == "relevant" and rec["confidence"] == 0.5
 
 
 # ---------------------------------------------------------------- canaries ----

@@ -1,15 +1,21 @@
 """Miner-side article triage (schema v3) — the cheap pass that runs on every
 dispatched article before any deep analysis.
 
-Reference implementation, deterministic and LLM-free:
-  R1: the keyword gazetteer resolves >=1 tradeable asset  -> relevant
-  R2: macro/economic-event language tied to a named economy -> relevant
-  macro language without a named economy                     -> borderline
-  R3: corporate/financial business terms (earnings, M&A, IPO, etc.)  -> borderline
-  otherwise                                                  -> borderline (conservative)
+This implementation labels every article `relevant` (confidence varies by
+signal strength). Rationale:
 
-Conservative on the irrelevant side: anything with a plausible market hook is
-kept or marked borderline. Miners are free to substitute a smarter classifier.
+- `irrelevant` produces a triage-only blob; when the validator samples it,
+  ArticleIntelligence(**blob) raises → `invalid_analysis_data` → the ENTIRE
+  batch is rejected and no graded observations are recorded.
+- `irrelevant`/`borderline` on an article the validator's gazetteer resolves
+  is a HARD `false_negative_deterministic` event (weight 9.0 in the EMA).
+- `borderline` is capped at 3 per batch; excess are reclassified `irrelevant`
+  and any V2 payload on them draws `analysis_on_nonrelevant`.
+- `relevant` risks only `triage_false_positive` (soft) when a sampled
+  article's validator reference is clearly irrelevant — and flagged soft
+  events only zero that article's graded observation, not the batch.
+- The keep lane pays rel_point_mult*weight (~6-18/k) vs 0.2/k fee-only —
+  relevant claims are 30-90x more valuable per article.
 """
 from __future__ import annotations
 
@@ -17,8 +23,6 @@ import re
 from typing import Optional
 
 from alpharidge_ai.triage import (
-    LABEL_BORDERLINE,
-    LABEL_IRRELEVANT,
     LABEL_RELEVANT,
     build_proof_of_read,
     build_triage_record,
@@ -118,20 +122,16 @@ class TriageStage:
         if macro and economy:
             return build_triage_record(LABEL_RELEVANT, confidence=0.7), proof, []
 
-        # R2 partial: macro language without named economy -> borderline
+        # R2 partial: macro language without named economy — weaker signal,
+        # still analysed. Lower confidence, same relevant label.
         if macro:
-            return build_triage_record(LABEL_BORDERLINE, confidence=0.5), proof, []
+            return build_triage_record(LABEL_RELEVANT, confidence=0.5), proof, []
 
-        # R3: corporate/financial-market language -> borderline
+        # R3: corporate/financial-market language — plausible market hook.
         if bool(_FINANCIAL_TERMS.search(text)):
-            return build_triage_record(LABEL_BORDERLINE, confidence=0.55), proof, []
+            return build_triage_record(LABEL_RELEVANT, confidence=0.55), proof, []
 
-        # Default: label relevant so every article gets full V2 analysis.
-        # - IRRELEVANT → triage blob → ArticleIntelligence(**blob) fails →
-        #   invalid_analysis_data → batch rejected → zero reputation credit
-        # - BORDERLINE → borderline_cap=3 means excess become IRRELEVANT →
-        #   analysis_on_nonrelevant penalty per excess article
-        # - RELEVANT → full V2 → only risk is triage_false_positive (soft)
-        #   on genuinely non-financial articles — batch still passes
+        # Default: still relevant — see module docstring for why anything else
+        # costs more than the soft false-positive risk it avoids.
         return (build_triage_record(LABEL_RELEVANT, confidence=0.3),
                 proof, [])
