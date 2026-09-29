@@ -82,7 +82,7 @@ def _analyze(a, art):
     # article-level direction, NOT a hardcoded "neutral".
     sents = score_assets(ner_assets, ner, _ASPECT_SCORER,
                          fallback_direction=_article_direction(ner))
-    assets = a._build_assets(ner, sents)
+    assets = a._build_assets(ner, sents, art["content"])
     entities = a._build_entities_from_ner(ner)
     one_liner = (art["content"][:200])
     narr = a._select_narratives(art["title"], one_liner, art["content"][:800])

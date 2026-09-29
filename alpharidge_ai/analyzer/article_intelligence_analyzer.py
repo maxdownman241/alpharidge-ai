@@ -22,6 +22,7 @@ import re
 import threading
 import time
 import traceback
+import unicodedata
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -549,6 +550,13 @@ class ArticleIntelligenceAnalyzer:
     ) -> Optional[ArticleIntelligence]:
         start_ms = int(time.time() * 1000)
         model = model or self.model
+        # NFC-normalise the title so the miner and validator agree on a canonical
+        # Unicode form regardless of how the synapse serialiser round-tripped the
+        # string.  _titles_match on the validator side compares analysis_data["title"]
+        # against reference.title using _normalize_text (lowercase + whitespace only),
+        # so a composed/decomposed mismatch (e.g. é vs e+combining-acute) survives
+        # _normalize_text and causes article_content_mismatch.
+        title = unicodedata.normalize('NFC', title or '').strip()
         body = content or summary or ""
         # Strip the disclosure/footer tail for the EXTRACTION path only (NER, assets,
         # LLM, sectors) so a "stocks mentioned" footer doesn't inject noise tickers.
@@ -588,10 +596,18 @@ class ArticleIntelligenceAnalyzer:
             call1 = self._llm_call(call1_prompt, EXTRACT_CLASSIFY_TOOL, "extract_and_classify",
                                    model, timeout=45.0, max_tokens=4000)
 
-            # Merge additional tickers from LLM
-            for t in call1.get("additional_tickers", []):
-                if t and t.upper() not in {x.upper() for x in all_tickers}:
-                    all_tickers.append(t.upper())
+            # Merge additional tickers from LLM. Also log the gap between what
+            # the LLM knows and what the gazetteer found — measuring this on
+            # live traffic tells us whether gazetteer coverage is worth
+            # extending or LLM tickers are worth merging into `assets`.
+            extra = [t.upper() for t in call1.get("additional_tickers", []) if t]
+            if extra:
+                ner_set = {x.upper() for x in all_tickers}
+                missed = [t for t in dict.fromkeys(extra) if t not in ner_set]
+                bt.logging.info(
+                    f"[TICKER_GAP] article {article_id}: llm_extra={extra} "
+                    f"gazetteer_missed={missed} gazetteer_found={sorted(ner_set)}")
+                all_tickers.extend(missed)
 
             # ── STAGE 3: LLM Call 2 — Reason & Summarize (~5-8s) ──
             call2 = {}
@@ -624,7 +640,7 @@ class ArticleIntelligenceAnalyzer:
             # off-LLM temporal projector) so they survive the validator's outlook
             # determinism gate; reconcile direction against the horizons only.
             self._reconcile_asset_directions(asset_sentiments)
-            assets = self._build_assets(ner_result, asset_sentiments)
+            assets = self._build_assets(ner_result, asset_sentiments, body)
             # Drop sell-side banks that are only the analyst roster of an earnings
             # transcript (participants, not the article's subject).
             assets = strip_analyst_roster_assets(assets, article_text)
@@ -643,17 +659,14 @@ class ArticleIntelligenceAnalyzer:
             elapsed_ms = int(time.time() * 1000) - start_ms
 
             # ── STAGE 4: Embeddings (~45ms) ──
-            # The validator's reference run skips Stage 3 (reference=True), so its
-            # chart_summary is title-derived: headline=title[:120], one_liner=title[:280],
-            # context_paragraph="". We force the same values so grounding (0.45 weight),
-            # semantic (0.10), and the summary_agreement floor compare near-identical text.
-            headline = title[:120]
+            # Validators run the full pipeline (analyze() with reference=False runs
+            # Call 2), so their chart_summary is LLM-generated — match it. Forcing
+            # title-derived text here diverged from the validator's LLM text:
+            # ~0.1 composite drag per article (chart_summary + narrative fields) and
+            # summary_agreement < 0.4 on non-English articles → article_content_mismatch.
+            headline = (call2.get("headline") or title[:120])[:120]
             one_liner = (call2.get("one_liner") or title[:280])[:280]
-            # Cap one_liner so the shared title prefix dominates the embedding — a
-            # long divergent LLM addition on a short title pushes summary_agreement
-            # below the 0.4 floor → article_content_mismatch → batch rejected.
-            one_liner = one_liner[:max(len(title) + 60, 120)][:280]
-            ctx_para = ""
+            ctx_para = (call2.get("context_paragraph") or "")[:1000]
             # Narrative slugs are selected deterministically from the taxonomy by
             # embedding similarity (with abstention), NOT by the LLM — this kills
             # the generic-crypto-slug hallucination and removes the field from Call 2.
@@ -683,7 +696,8 @@ class ArticleIntelligenceAnalyzer:
                 assets=assets,
                 entities=entities,
                 economic_data=self._build_economic_data(call1.get("economic_data", [])),
-                numeric_claims=self._build_numeric_claims(call1.get("numeric_claims", [])),
+                numeric_claims=self._build_numeric_claims(call1.get("numeric_claims", []),
+                                                          content or ""),
                 quotes=self._build_quotes(call1.get("quotes", []), content or ""),
                 contagion_links=self._build_contagion_from_graph(ner_tickers),
                 chart_summary=ChartSummary(
@@ -908,12 +922,14 @@ class ArticleIntelligenceAnalyzer:
                 s.get("medium_term") or "neutral",
                 s.get("long_term") or "neutral")
 
-    def _build_assets(self, ner_result, sentiments_raw: list) -> List[AssetSentiment]:
+    def _build_assets(self, ner_result, sentiments_raw: list,
+                      body: str = "") -> List[AssetSentiment]:
         sentiment_by_ticker = {}
         for s in sentiments_raw:
             t = s.get("ticker", "").upper()
             if t:
                 sentiment_by_ticker[t] = s
+        article_norm = oracle_floor.normalize(body)
 
         assets = []
         for e in ner_result.resolved_assets:
@@ -937,11 +953,80 @@ class ArticleIntelligenceAnalyzer:
                     relevance_score=min(1.0, e.confidence),
                     is_primary_subject=getattr(e, "is_primary_subject", False),
                     resolved_via=getattr(e, "source", "keyword") or "keyword",
-                    evidence_spans=[e.text],
+                    evidence_spans=self._evidence_spans(
+                        e, s.get("evidence_spans"), body, article_norm),
                 ))
             except Exception as ex:
                 bt.logging.debug(f"[ARTICLE_INTEL] Skip asset {e.ticker}: {ex}")
         return assets
+
+    _EVIDENCE_SPAN_CHARS = 240   # cap; sentences can run long
+    _EVIDENCE_HALF_WINDOW = 80   # context each side of a surface-form match
+    _EVIDENCE_MAX_SPANS = 3
+
+    def _evidence_spans(self, e, sentiment_spans, body: str, article_norm) -> List[str]:
+        """Evidence spans for one asset, verified the way the floor verifies them.
+
+        A bare surface form proves nothing (the floor needs >=12 chars or >=3
+        context words beyond the ticker), so a span is only emitted when it is
+        verbatim in the served body AND passes the validator's own
+        span_supported check. An empty list is skipped by the floor entirely —
+        strictly better than asserting a span that fails, which both lowers
+        floor_quality and drops the asset from keeper judgment fields.
+        """
+        ticker = getattr(e, "ticker", None) or ""
+        if not body or not article_norm.text:
+            return []
+        out, seen = [], set()
+
+        def _accept(span) -> None:
+            span = (span or "").strip()
+            if len(span) > self._EVIDENCE_SPAN_CHARS:
+                span = span[:self._EVIDENCE_SPAN_CHARS]
+                cut = span.rfind(" ")
+                if cut >= 40:
+                    span = span[:cut]
+            if not span:
+                return
+            if not oracle_floor.span_supported(article_norm, span, ticker):
+                return
+            key = oracle_floor.normalize(span).text
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(span)
+
+        # Sentiment mention sentences are real prose; they may come from a
+        # cleaned text path, so each still has to verify against the body.
+        for span in (sentiment_spans or []):
+            _accept(span)
+            if len(out) >= self._EVIDENCE_MAX_SPANS:
+                return out
+
+        # Fallback: a verbatim window around the first occurrence of any surface
+        # form. Matches were found in a cleaned/truncated text, so locate the
+        # form in `body` itself (case-insensitive — gazetteer spans are
+        # lowercased) and slice the surrounding context from the raw text.
+        forms = [getattr(e, "text", None)]
+        forms += list(getattr(e, "surface_forms", None) or [])
+        forms += [getattr(e, "canonical_name", None), ticker]
+        for form in forms:
+            form = str(form or "").strip()
+            if len(form) < 2:
+                continue
+            m = re.search(rf"(?<!\w){re.escape(form)}(?!\w)", body, re.IGNORECASE)
+            if not m:
+                continue
+            lo = max(0, m.start() - self._EVIDENCE_HALF_WINDOW)
+            hi = min(len(body), m.end() + self._EVIDENCE_HALF_WINDOW)
+            while lo > 0 and not body[lo].isspace():
+                lo -= 1
+            while hi < len(body) and not body[hi - 1].isspace():
+                hi += 1
+            _accept(body[lo:hi])
+            if out:
+                break
+        return out
 
     def _primary_asset_gics(self, assets) -> tuple:
         """(gics_sector, gics_industry) for the primary-subject asset, from the
@@ -1092,7 +1177,16 @@ class ArticleIntelligenceAnalyzer:
         except (TypeError, ValueError):
             return default
 
-    def _build_numeric_claims(self, raw: list) -> List[NumericClaim]:
+    def _build_numeric_claims(self, raw: list, content: str = "") -> List[NumericClaim]:
+        # Ground every claim against the same parser the floor runs, before the
+        # cap. An ungroundable claim can never be in the grader's gold set — the
+        # reference's claims pass the identical check — so it can only cost
+        # precision, floor_quality's claim rate, and calibration. Literal claims
+        # auto-validate at audit, so a high confidence is honest and earns the
+        # proper-score calibration term; inferred claims are adjudicated and
+        # stay genuinely uncertain.
+        numbers = (oracle_floor.parse_numbers(oracle_floor.normalize(content).text)
+                   if content else [])
         claims = []
         for c in (raw or []):
             if len(claims) >= MAX_NUMERIC_CLAIMS:
@@ -1100,15 +1194,24 @@ class ArticleIntelligenceAnalyzer:
             if not isinstance(c, dict) or self._is_date_claim(c):
                 continue
             try:
-                claims.append(NumericClaim(
+                claim = NumericClaim(
                     metric_name=c["metric_name"], value=c["value"],
                     unit=c.get("unit", "other"),
                     context=(c.get("context") or "")[:200],
                     is_percentage_change=c.get("is_percentage_change", False),
                     confidence=self._confidence(c.get("confidence")),
-                ))
+                )
             except Exception:
-                pass
+                continue
+            if numbers:
+                kind = oracle_floor.ground_kind(claim, numbers)
+                if kind is None:
+                    continue
+                if kind == "literal":
+                    claim.confidence = max(claim.confidence, 0.95)
+                else:
+                    claim.confidence = min(claim.confidence, 0.7)
+            claims.append(claim)
         return claims
 
     def _build_quotes(self, raw: list, content: str = "") -> List[QuoteExtraction]:
@@ -1139,7 +1242,10 @@ class ArticleIntelligenceAnalyzer:
                     text=text,
                     sentiment=_safe_enum(Sentiment, q.get("sentiment"), Sentiment.NEUTRAL),
                     is_market_moving=q.get("is_market_moving", False),
-                    confidence=self._confidence(q.get("confidence")),
+                    # The quote is verified verbatim against the body above; the
+                    # residual uncertainty is only whether the grader's own run
+                    # emitted a quote aligning to the same span — honest band.
+                    confidence=min(0.9, max(0.8, self._confidence(q.get("confidence")))),
                     start_offset=start, end_offset=end,
                 ))
             except Exception:

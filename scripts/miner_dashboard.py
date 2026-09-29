@@ -74,7 +74,8 @@ def _refresh_dash():
             row["emission_midpoint"] = rep.get("emission_midpoint")
             row["latest"] = rep.get("latest") or {}
             row["rep_history"] = [
-                {"epoch": h.get("epoch"), "reputation": h.get("reputation")}
+                {"epoch": h.get("epoch"), "reputation": h.get("reputation"),
+                 "emission_mult": h.get("emission_mult")}
                 for h in (rep.get("history") or [])[:30]
             ]
         except Exception:
@@ -85,7 +86,8 @@ def _refresh_dash():
             row["batches"] = [
                 {k: b.get(k) for k in
                  ("epoch", "earned_items", "penalty_items", "penalty_breakdown",
-                  "reward_points_max", "was_zeroed", "flagged_by_validators")}
+                  "reward_points_max", "was_zeroed", "flagged_by_validators",
+                  "diagnosis")}
                 for b in batches
             ]
         except Exception:
@@ -216,7 +218,7 @@ PAGE = """<!doctype html>
 <div class="sub" id="upd">loading…</div>
 <table><thead><tr>
   <th>miner</th><th>uid</th><th>reputation</th><th>rep</th><th>mult</th>
-  <th>samples</th><th>incentive</th><th>rank</th><th>last epochs (earned / penalties)</th>
+  <th>samples</th><th>incentive</th><th>rank</th><th>last epochs (points [items] / penalties)</th>
 </tr></thead><tbody id="rows"></tbody></table>
 
 <h1 style="margin-top:32px">Subnet reputation <span class="sub" id="subnet-upd"></span></h1>
@@ -227,7 +229,27 @@ PAGE = """<!doctype html>
 async function load() {
   const d = await (await fetch('/api/fleet')).json();
   const tb = document.getElementById('rows'); tb.innerHTML = '';
-  const mid = (Object.values(d.miners)[0]||{}).emission_midpoint || 0.57;
+  // Fit the live gate curve from served (reputation, emission_mult) pairs:
+  // logit(m) = gain*(r - mid). The API's emission_midpoint field has proven
+  // stale vs the curve the snapshots were computed with, so derive it.
+  let mid = 0.505, gain = 32;
+  {
+    const xs = [], ys = [];
+    for (const m of Object.values(d.miners)) {
+      for (const h of (m.rep_history || [])) {
+        const r = h.reputation, mu = h.emission_mult;
+        if (r != null && mu != null && mu > 1e-6 && mu < 1 - 1e-6) {
+          xs.push(r); ys.push(Math.log(mu / (1 - mu)));
+        }
+      }
+    }
+    if (xs.length >= 5) {
+      const n = xs.length, mx = xs.reduce((a,b)=>a+b)/n, my = ys.reduce((a,b)=>a+b)/n;
+      let sxx = 0, sxy = 0;
+      for (let i = 0; i < n; i++) { sxx += (xs[i]-mx)*(xs[i]-mx); sxy += (xs[i]-mx)*(ys[i]-my); }
+      if (sxx > 1e-9) { gain = sxy / sxx; mid = mx - my / gain; }
+    }
+  }
   const names = Object.keys(d.miners).sort();
   for (const n of names) {
     const m = d.miners[n], c = (d.chain||{})[n] || {};
@@ -239,7 +261,13 @@ async function load() {
       `<span class="mid" style="left:${mid*100}%"></span></span>`;
     const eps = (m.batches||[]).map(b => {
       const pen = b.penalty_items ? `<span class="pen">-${b.penalty_items} ${Object.keys(b.penalty_breakdown||{}).join(',')}</span>` : '0';
-      return `<span class="ep">${b.epoch}: +${b.earned_items} / ${pen}</span>`;
+      const sev = ((b.diagnosis||{}).severity) || '';
+      const sevCls = sev === 'ok' ? 'good' : (sev === 'warn' ? 'warn' : (sev ? 'bad' : ''));
+      const pts = b.reward_points_max == null ? '—' :
+        `<b class="${sevCls}">${Math.round(b.reward_points_max)}pts</b>`;
+      const flags = (b.was_zeroed ? ' <b class="bad">ZEROED</b>' : '') +
+        (b.flagged_by_validators ? ` <span class="warn">flagged×${b.flagged_by_validators}</span>` : '');
+      return `<span class="ep">${b.epoch}: ${pts} <span class="sub">(${b.earned_items} it)</span> / ${pen}${flags}</span>`;
     }).join('');
     tb.innerHTML += `<tr>
       <td>${n}${c.registered===false?' <span class="bad">(unreg)</span>':''}</td>
@@ -256,7 +284,8 @@ async function load() {
   const t = d.updated && d.updated.dash;
   document.getElementById('upd').textContent =
     'updated ' + (t ? new Date(t*1000).toLocaleTimeString() : '…') +
-    ' — midpoint ' + mid + ' — refreshes every 60s';
+    ' — gate mid ' + mid.toFixed(3) + ' gain ' + gain.toFixed(0) +
+    ' (fitted) — refreshes every 60s';
 
   const sn = d.subnet || {};
   const bands = [['top 5', sn.top], ['median', sn.middle], ['bottom 5', sn.bottom]];

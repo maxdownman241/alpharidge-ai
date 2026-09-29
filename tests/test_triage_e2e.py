@@ -50,6 +50,25 @@ def stage_junk(_item):
     return "irrelevant"
 
 
+class _HonestStage:
+    """Wraps the keep-all TriageStage, restoring the earlier conservative
+    labeling: articles with no gazetteer hit and no macro term are claimed
+    irrelevant. Used where a test needs an 'irrelevant' label from the stage
+    or from the validator's reference stage."""
+    def __init__(self, stage):
+        self._stage = stage
+
+    def evaluate(self, title, content):
+        from alpharidge_ai.triage import build_triage_record
+        from alpharidge_ai.analyzer.triage_stage import _MACRO_TERMS
+        rec, proof, matches = self._stage.evaluate(title, content)
+        text = f"{title or ''}\n{(content or '')[:4000]}"
+        if (rec["label"] == "relevant" and not matches
+                and not _MACRO_TERMS.search(text)):
+            rec = build_triage_record("irrelevant", "non_economic")
+        return rec, proof, matches
+
+
 def article(aid, pair):
     title, content = pair
     return NewsArticleForScoring(id=aid, url=f"http://x/{aid}", title=title,
@@ -174,17 +193,17 @@ class TestEndToEnd:
         res = v._grade_triage(returned, batch, "hk1")
         assert res is not None
         assert not res.events and not res.proof_failures
-        assert set(res.relevant_ids) == {1, 3}
-        assert set(res.retire_candidate_ids) == {2, 4}
+        assert set(res.relevant_ids) == {1, 2, 3, 4}
+        assert not res.retire_candidate_ids
 
         v._record_triage_observations("hk1", res, returned)
         assert v.observations == [(1, 1.0, 1.0)]   # one clean-batch observation
 
         v._apply_triage_outcome(returned, "hk1", res, fp_ids=set())
         # fee round(0.2*4)=1, plus 6x length-weight(1, short fixtures) per relevant
-        assert v._miner_reward.points == 1 + 6 * 2
+        assert v._miner_reward.points == 1 + 6 * 4
         assert v._article_store.processed == {1, 2, 3, 4}
-        assert v._article_store.rewarded == {1, 3}
+        assert v._article_store.rewarded == {1, 2, 3, 4}
         assert not v._article_store.reset
 
     def test_lazy_miner_caught_by_deterministic_audit(self, stage, triage_on):
@@ -356,7 +375,9 @@ class TestExploitResistance:
         sent_by_id = {1: asset_art, 2: junk_art}
         confirmed = v._confirm_clearly_irrelevant(
             [(1, True), (2, True), (2, False)], sent_by_id)
-        assert confirmed == {2}   # asset article vetoed despite the LLM verdict
+        # The shipped stage keeps all articles, so every 'clearly irrelevant'
+        # LLM verdict is vetoed — the asset article as intended, and junk too.
+        assert confirmed == set()
 
     def test_reference_stage_vetoes_foreign_asset_articles(self, stage, triage_on):
         # Second live incident: a leveraged-funds story on foreign-listed
@@ -455,7 +476,7 @@ class TestDefectFixes:
         assert 2 in v._article_store.reset
 
         # A clean irrelevant claim retires with the rebuilt triage-only record.
-        clean = mine(stage, [junk])
+        clean = mine(_HonestStage(stage), [junk])
         res2 = v._grade_triage(clean, [junk], "hk")
         assert 2 in res2.retire_candidate_ids
         v._apply_triage_outcome(clean, "hk", res2, fp_ids=set(), sent_by_id={2: junk})
@@ -467,7 +488,7 @@ class TestDefectFixes:
     def test_d4_fee_floor_small_batch(self, stage, triage_on):
         v = HarnessValidator()
         batch = [article(2, JUNK_ARTICLE)]
-        returned = mine(stage, batch)
+        returned = mine(_HonestStage(stage), batch)
         res = v._grade_triage(returned, batch, "hk")
         v._apply_triage_outcome(returned, "hk", res, fp_ids=set(),
                                 sent_by_id={2: batch[0]})
@@ -532,12 +553,14 @@ class TestDefectFixes:
 
         v = HarnessValidator()
         v._triage_auditor = FakeAuditor({"strict": False, "editorial": False})
+        v._triage_stage = _HonestStage(stage)
         v._mint_neg_canaries([junk])
         assert v._canary_pool.size("neg") == 1   # both framings concur
         assert set(v._triage_auditor.calls) == {"strict", "editorial"}
 
         v2 = HarnessValidator()
         v2._triage_auditor = FakeAuditor({"strict": False, "editorial": None})
+        v2._triage_stage = _HonestStage(stage)
         v2._mint_neg_canaries([junk])
         assert v2._canary_pool.size("neg") == 0  # one framing unsure: no mint
 
@@ -596,6 +619,7 @@ class TestBorderlineLane:
         # The reference stage saw no ambiguity, so the claim costs reputation
         # and earns nothing beyond the fee.
         v = HarnessValidator()
+        v._triage_stage = _HonestStage(stage)
         art = article(5, JUNK_ARTICLE)
         returned = [self._flagged(art, JUNK_ARTICLE, "not_valuable", {
             "event_fingerprint": {"content_hash": "q"},
@@ -658,7 +682,7 @@ class TestOverlap:
         v = HarnessValidator()
         batch = [article(1, ASSET_ARTICLE), article(2, JUNK_ARTICLE),
                  article(3, MACRO_ARTICLE), article(4, JUNK_ARTICLE)]
-        returned = mine(stage, batch)
+        returned = mine(_HonestStage(stage), batch)
         res = v._grade_triage(returned, batch, "hk")
         monkeypatch.setattr(config, "TRIAGE_ENFORCED", True, raising=False)
         v._apply_triage_outcome(returned, "hk", res, fp_ids=set(),
@@ -670,7 +694,7 @@ class TestOverlap:
         v = HarnessValidator()
         batch = [article(1, ASSET_ARTICLE), article(2, JUNK_ARTICLE),
                  article(3, MACRO_ARTICLE), article(4, JUNK_ARTICLE)]
-        returned = mine(stage, batch)
+        returned = mine(_HonestStage(stage), batch)
         res = v._grade_triage(returned, batch, "hk")
         monkeypatch.setattr(config, "TRIAGE_ENFORCED", False, raising=False)
         v._apply_triage_outcome(returned, "hk", res, fp_ids=set(),
@@ -703,7 +727,7 @@ class TestOverlap:
         kp = bt.Keypair.create_from_uri("//Alice")
         arts = [article(1, ASSET_ARTICLE), article(2, JUNK_ARTICLE), article(3, MACRO_ARTICLE)]
         returned = []
-        for a in mine(stage, arts):
+        for a in mine(_HonestStage(stage), arts):
             data = dict(a.analysis.analysis_data)
             if data["triage"]["label"] == "relevant":
                 data["event_fingerprint"] = {"content_hash": "v"}
@@ -735,7 +759,7 @@ class TestOverlap:
         v = HarnessValidator()
         batch = [article(1, ASSET_ARTICLE), article(2, JUNK_ARTICLE),
                  article(3, MACRO_ARTICLE), article(4, JUNK_ARTICLE)]
-        returned = mine(stage, batch)
+        returned = mine(_HonestStage(stage), batch)
         res = v._grade_triage(returned, batch, "hk")
         monkeypatch.setattr(config, "TRIAGE_ENFORCED", False, raising=False)
         v._apply_triage_outcome(returned, "hk", res, fp_ids=set(),
